@@ -31,7 +31,7 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# ── Routing table auto-detection ─────────────────────────────────────────────
+# --- Routing table auto-detection -------------------------------------------
 # Reads /etc/iproute2/rt_tables and finds the highest non-system table number
 # (excluding reserved 0/253/254/255), then returns max+1. This avoids
 # collisions with UniFiOS WAN tables (201 = WAN1, 202 = WAN2, 203 = WAN3...).
@@ -48,7 +48,7 @@ _detect_rt_table() {
     echo $((highest + 1))
 }
 
-# ── Create voipd.conf from example if not already present ────────────────────
+# --- Create voipd.conf from example if not already present ------------------
 
 _create_config() {
     if [ -f "$CONF_FILE" ]; then
@@ -64,7 +64,7 @@ _create_config() {
     echo "  Done. Edit $CONF_FILE or use the web UI at https://<gateway>/voip"
 }
 
-# ── Install voipd ─────────────────────────────────────────────────────────────
+# --- Install voipd -----------------------------------------------------------
 
 install_service() {
     echo "Installing VoIP service..."
@@ -89,7 +89,7 @@ install_service() {
     echo "  Logs:   journalctl -u ${SERVICE_NAME} -f"
 }
 
-# ── Uninstall voipd ───────────────────────────────────────────────────────────
+# --- Uninstall voipd ---------------------------------------------------------
 
 uninstall_service() {
     echo "Uninstalling VoIP daemon..."
@@ -103,7 +103,7 @@ uninstall_service() {
     echo "  To remove everything:      ./voip uninstall-ui && rm -rf /data/voip"
 }
 
-# ── Update from GitHub ────────────────────────────────────────────────────────
+# --- Update from GitHub ------------------------------------------------------
 
 update_service() {
     echo "Updating VoIP service from GitHub..."
@@ -116,7 +116,7 @@ update_service() {
     fi
     mv voip-main voip-update-tmp
 
-    # ── Daemon: only reinstall if binary actually changed ─────────────────────
+    # --- Daemon: only reinstall if binary actually changed -------------------
     local _voipd_changed=false
     if ! cmp -s voip-update-tmp/voipd /usr/local/bin/voipd 2>/dev/null; then
         _voipd_changed=true
@@ -139,7 +139,7 @@ update_service() {
         echo "  voipd unchanged — skipping reinstall."
     fi
 
-    # ── server.py: only restart voip-ui if it changed ────────────────────────
+    # --- server.py: only restart voip-ui if it changed ----------------------────
     local _server_changed=false
     if [ -f voip-update-tmp/ui/server.py ] && \
        ! cmp -s voip-update-tmp/ui/server.py /data/voip/ui/server.py 2>/dev/null; then
@@ -157,10 +157,10 @@ update_service() {
         echo "  server.py unchanged — skipping restart."
     fi
 
-    # ── UI bundle: download only if new release available ────────────────────
+    # --- UI bundle: download only if new release available ------------------
     _update_ui_bundle
 
-    # ── nginx: only touch if token is missing or config not yet patched ───────
+    # --- nginx: only touch if token is missing or config not yet patched ----
     # Always re-run install-ui --quiet on update so the boot hook and
     # voip-restore.service are refreshed even when nginx is already patched.
     # install-ui is idempotent — it skips steps already done.
@@ -170,7 +170,7 @@ update_service() {
     echo "Update complete. voipd.conf preserved."
 }
 
-# ── Download UI bundle from GitHub Releases ───────────────────────────────────
+# --- Download UI bundle from GitHub Releases ---------------------------------
 
 _update_ui_bundle() {
     local release_url asset_url tag
@@ -200,7 +200,7 @@ _update_ui_bundle() {
     echo "  UI bundle updated to ${tag}."
 }
 
-# ── Install web UI ────────────────────────────────────────────────────────────
+# --- Install web UI ----------------------------------------------------------
 
 install_ui() {
     # --quiet: suppress the final "Web UI installed" banner (used by update_service)
@@ -274,7 +274,7 @@ WantedBy=multi-user.target"
     fi
 }
 
-# ── Uninstall web UI ──────────────────────────────────────────────────────────
+# --- Uninstall web UI --------------------------------------------------------
 
 uninstall_ui() {
     echo "Uninstalling VoIP web UI..."
@@ -289,7 +289,7 @@ uninstall_ui() {
     echo "Web UI removed. /data/voip and voipd.conf preserved."
 }
 
-# ── nginx: inject location block into UniFi OS site config ───────────────────
+# --- nginx: inject location block into UniFi OS site config -----------------
 # UniFi OS nginx only reads site-*.conf from /data/unifi-core/config/http/.
 # Those files are included at the http{} level and contain full server{} blocks.
 # To add a location to the main 443 server we:
@@ -431,7 +431,7 @@ SVCEOF
     echo "  Restore service → voip-restore.service (enabled)"
 }
 
-# ── nginx: remove location block ─────────────────────────────────────────────
+# --- nginx: remove location block --------------------------------------------
 
 _nginx_uninstall() {
     # Remove our include line (and the marker) from site-local-ip.conf.
@@ -455,7 +455,7 @@ _nginx_uninstall() {
     echo "  nginx config removed"
 }
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# --- Entry point -------------------------------------------------------------
 
 case "${1:-}" in
     install)      install_service ;;
