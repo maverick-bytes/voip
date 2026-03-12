@@ -1,5 +1,5 @@
 import { useState, useEffect } from "react";
-import { Terminal, Download, Trash2, RefreshCw, CheckCircle, Loader2, AlertTriangle, X, Check } from "lucide-react";
+import { Terminal, Download, Trash2, RefreshCw, CheckCircle, Loader2, Play, AlertTriangle, X, Check } from "lucide-react";
 import { postJson } from "@/lib/api";
 
 // ── Shared result dialog (shown after any command completes) ──────────────────
@@ -133,7 +133,14 @@ const commands = [
     icon: CheckCircle,
     variant: "verify" as const,
   },
-
+  {
+    id: "restart",
+    label: "Restart Service",
+    description: "Restart voipd — reconnects DHCP, re-applies routing and firewall rules",
+    command: "systemctl restart voipd",
+    icon: Play,
+    variant: "install" as const,
+  },
   {
     id: "uninstall",
     label: "Uninstall",

@@ -14,6 +14,16 @@
     <meta property="og:title" content="VoIP Control Panel — UniFi OS" />
     <meta property="og:description" content="Web UI for managing the voipd VoIP daemon on UniFi OS." />
     <meta property="og:type" content="website" />
+
+    <!-- Apply saved theme synchronously before first paint to avoid white flash.
+         Must be a blocking (non-module) script so it runs before CSS is applied. -->
+    <script>
+      (function () {
+        var saved = localStorage.getItem("voip-theme");
+        var dark = saved ? saved === "dark" : window.matchMedia("(prefers-color-scheme: dark)").matches;
+        if (dark) document.documentElement.classList.add("dark");
+      })();
+    </script>
   </head>
 
   <body>
