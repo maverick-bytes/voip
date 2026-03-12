@@ -112,25 +112,61 @@ update_service() {
     curl -sL "${GITHUB_BASE}/archive/refs/heads/main.tar.gz" | tar -xz
     mv voip-main voip-update-tmp
 
-    cp voip-update-tmp/voipd           /data/voip/voipd
-    cp voip-update-tmp/voip            /data/voip/voip
-    cp voip-update-tmp/voipd.service   /data/voip/voipd.service
-    cp voip-update-tmp/uninstall.sh    /data/voip/uninstall.sh
+    # ── Daemon: only reinstall if binary actually changed ─────────────────────
+    local _voipd_changed=false
+    if ! cmp -s voip-update-tmp/voipd /usr/local/bin/voipd 2>/dev/null; then
+        _voipd_changed=true
+    fi
+    cp voip-update-tmp/voipd         /data/voip/voipd
+    cp voip-update-tmp/voip          /data/voip/voip
+    cp voip-update-tmp/voipd.service /data/voip/voipd.service
+    cp voip-update-tmp/uninstall.sh  /data/voip/uninstall.sh
     [ -f voip-update-tmp/voipd.conf.example ] && \
         cp voip-update-tmp/voipd.conf.example /data/voip/voipd.conf.example
+    chmod +x /data/voip/voipd /data/voip/voip /data/voip/uninstall.sh
+
+    if [ "$_voipd_changed" = "true" ]; then
+        cp /data/voip/voipd /usr/local/bin/voipd
+        cp /data/voip/voipd.service /lib/systemd/system/voipd.service
+        systemctl daemon-reload
+        systemctl restart voipd
+        echo "  voipd updated and restarted."
+    else
+        echo "  voipd unchanged — skipping reinstall."
+    fi
+
+    # ── server.py: only restart voip-ui if it changed ────────────────────────
+    local _server_changed=false
+    if [ -f voip-update-tmp/ui/server.py ] && \
+       ! cmp -s voip-update-tmp/ui/server.py /data/voip/ui/server.py 2>/dev/null; then
+        _server_changed=true
+    fi
     [ -d voip-update-tmp/ui ] && \
         cp -r voip-update-tmp/ui/. /data/voip/ui/ 2>/dev/null || true
 
-    chmod +x /data/voip/voipd /data/voip/voip /data/voip/uninstall.sh
     rm -rf /data/voip-update-tmp
 
+    if [ "$_server_changed" = "true" ]; then
+        systemctl restart voip-ui 2>/dev/null || true
+        echo "  server.py updated and voip-ui restarted."
+    else
+        echo "  server.py unchanged — skipping restart."
+    fi
+
+    # ── UI bundle: download only if new release available ────────────────────
     _update_ui_bundle
 
-    cd /data/voip && ./voip install
-    # Re-run install-ui --quiet to refresh server.py and nginx config.
-    # --quiet suppresses the "Web UI installed" banner since this is an update,
-    # not a fresh install. The token file is preserved if it already exists.
-    ./voip install-ui --quiet
+    # ── nginx: only touch if token is missing or config not yet patched ───────
+    local _needs_nginx=false
+    [ ! -f /data/voip/ui/.internal-token ] && _needs_nginx=true
+    ! grep -q "${NGINX_MARKER}" "${NGINX_SITE_CONF}" 2>/dev/null && _needs_nginx=true
+    if [ "$_needs_nginx" = "true" ]; then
+        echo "  nginx config missing — reapplying..."
+        cd /data/voip && ./voip install-ui --quiet
+    else
+        echo "  nginx config unchanged — skipping."
+    fi
+
     echo "Update complete. voipd.conf preserved."
 }
 
