@@ -258,7 +258,12 @@ WantedBy=multi-user.target"
     systemctl daemon-reload
     systemctl enable ${UI_SERVICE_NAME}
     systemctl start  ${UI_SERVICE_NAME}
-    nginx -s reload 2>/dev/null || true
+    # Reload nginx with retries — at boot nginx may not be ready to accept
+    # signals immediately even after its systemd unit reports started.
+    _i=0
+    until nginx -s reload 2>/dev/null || [ $_i -ge 10 ]; do
+        sleep 2; _i=$((_i + 1))
+    done
 
     if [ "$_quiet" = "false" ]; then
         echo ""
@@ -410,7 +415,7 @@ BOOTEOF
     cat > /etc/systemd/system/voip-restore.service << SVCEOF
 [Unit]
 Description=Restore VoIP nginx config after reboot
-After=network.target nginx.service
+After=multi-user.target nginx.service
 Wants=nginx.service
 
 [Service]
