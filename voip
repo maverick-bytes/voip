@@ -366,8 +366,15 @@ LOCEOF
     echo "  Location config → ${NGINX_LOC_CONF}"
 
     # Inject include into site-local-ip.conf (idempotent).
-    # Uses a busybox-compatible approach — no GNU sed extensions.
-    if ! grep -q "${NGINX_MARKER}" "${NGINX_SITE_CONF}" 2>/dev/null; then
+    # Wait up to 30s for the file to appear — at boot, nginx.service being
+    # started doesn't guarantee it has written its config files yet.
+    local _waited=0
+    while [ ! -f "${NGINX_SITE_CONF}" ] && [ $_waited -lt 30 ]; do
+        sleep 1; _waited=$((_waited + 1))
+    done
+    if [ ! -f "${NGINX_SITE_CONF}" ]; then
+        echo "  WARNING: ${NGINX_SITE_CONF} not found after 30s — skipping patch"
+    elif ! grep -q "${NGINX_MARKER}" "${NGINX_SITE_CONF}" 2>/dev/null; then
         cp "${NGINX_SITE_CONF}" "${NGINX_SITE_CONF}.voip-bak"
         # Build the two lines to insert, then splice them in with awk.
         # awk is available on all busybox/GNU systems; GNU sed a\ with \n is not.
