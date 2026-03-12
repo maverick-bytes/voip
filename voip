@@ -384,10 +384,11 @@ LOCEOF
         echo "  ${NGINX_SITE_CONF} already patched — skipping"
     fi
 
-    # Boot hook: re-apply nginx patch AND restart services after firmware upgrades.
-    # /lib/systemd/system/ is a volatile tmpfs on UCG-Fiber — it gets wiped on
-    # every reboot. The hook reinstalls both service files and restarts them
-    # before reloading nginx, so the UI is always available after reboot.
+    # Boot restore: re-apply nginx config AND restart services after reboots.
+    # Two mechanisms for reliability:
+    #   1. on_boot.d script  — UniFi OS hook, runs early but timing varies
+    #   2. voip-restore.service — systemd unit, guaranteed After=nginx.service
+    # Both do the same work; whichever runs second is a no-op (idempotent).
     mkdir -p /data/on_boot.d
     cat > "${boot_hook}" << BOOTEOF
 #!/bin/sh
@@ -396,6 +397,7 @@ LOCEOF
 SITE="${NGINX_SITE_CONF}"
 MARKER="${NGINX_MARKER}"
 LOC="${NGINX_LOC_CONF}"
+TOKEN_FILE="/data/voip/ui/.internal-token"
 SVC_DIR="/lib/systemd/system"
 
 # Reinstall voipd service if missing
@@ -414,6 +416,37 @@ systemctl enable voip-ui 2>/dev/null || true
 systemctl start  voipd   2>/dev/null || true
 systemctl start  voip-ui 2>/dev/null || true
 
+# Regenerate voip-location.conf if missing (it lives in /data/ so it
+# survives reboots, but gets wiped on firmware upgrades).
+if [ ! -f "\$LOC" ]; then
+    _secret=\$(cat "\$TOKEN_FILE" 2>/dev/null || true)
+    if [ -n "\$_secret" ]; then
+        cat > "\$LOC" << LOCEOF
+# VoIP Control Panel — restored by boot hook
+location /voip/api/ {
+    proxy_pass http://127.0.0.1:8099;
+    proxy_http_version 1.1;
+    proxy_set_header Host \\\$host;
+    proxy_set_header X-Real-IP \\\$remote_addr;
+    proxy_set_header X-Voip-Token \$_secret;
+    proxy_read_timeout 120s;
+}
+location /voip {
+    auth_request /internal/auth/public-api;
+    error_page 401 = @voip_unauth;
+    proxy_pass http://127.0.0.1:8099;
+    proxy_http_version 1.1;
+    proxy_set_header Host \\\$host;
+    proxy_set_header X-Real-IP \\\$remote_addr;
+    proxy_read_timeout 120s;
+}
+location @voip_unauth {
+    return 302 https://\\\$host/;
+}
+LOCEOF
+    fi
+fi
+
 # Re-patch nginx site config if needed
 if ! grep -q "\$MARKER" "\$SITE" 2>/dev/null; then
     cp "\$SITE" "\$SITE.voip-bak"
@@ -425,6 +458,27 @@ nginx -s reload 2>/dev/null || true
 BOOTEOF
     chmod +x "${boot_hook}"
     echo "  Boot hook → ${boot_hook}"
+
+    # Also install a systemd unit as a guaranteed fallback.
+    # on_boot.d timing on UCG-Fiber is unreliable — this unit runs
+    # After=nginx.service so nginx is always up before we reload it.
+    cat > /etc/systemd/system/voip-restore.service << SVCEOF
+[Unit]
+Description=Restore VoIP nginx config after reboot
+After=network.target nginx.service
+Wants=nginx.service
+
+[Service]
+Type=oneshot
+ExecStart=/data/on_boot.d/99-voip-nginx.sh
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+SVCEOF
+    systemctl daemon-reload
+    systemctl enable voip-restore.service 2>/dev/null || true
+    echo "  Restore service → voip-restore.service (enabled)"
 }
 
 # ── nginx: remove location block ─────────────────────────────────────────────
@@ -443,6 +497,9 @@ _nginx_uninstall() {
     fi
     rm -f "${NGINX_LOC_CONF}"
     rm -f /data/on_boot.d/99-voip-nginx.sh
+    systemctl disable voip-restore.service 2>/dev/null || true
+    rm -f /etc/systemd/system/voip-restore.service
+    systemctl daemon-reload 2>/dev/null || true
     # Clean up old conf.d file if it exists from a previous install attempt
     rm -f /etc/nginx/conf.d/voip-ui.conf
     echo "  nginx config removed"
