@@ -1,0 +1,31 @@
+# Node / npm
+ui/panel/node_modules/
+ui/panel/.npm/
+
+# Vite build output — distributed as GitHub Release asset (ui-dist.tar.gz)
+ui/panel/dist/
+
+# Vite cache
+ui/panel/.vite/
+
+# TypeScript cache
+ui/panel/*.tsbuildinfo
+
+# Editor & OS
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.vscode/
+.idea/
+
+# Local env overrides
+.env.local
+.env.*.local
+
+# nginx backup files created by install-ui
+*.voip-bak
+*.voip-bak-rm
+
+# Internal token (generated at install time, never committed)
+ui/.internal-token
