@@ -161,15 +161,11 @@ update_service() {
     _update_ui_bundle
 
     # ── nginx: only touch if token is missing or config not yet patched ───────
-    local _needs_nginx=false
-    [ ! -f /data/voip/ui/.internal-token ] && _needs_nginx=true
-    ! grep -q "${NGINX_MARKER}" "${NGINX_SITE_CONF}" 2>/dev/null && _needs_nginx=true
-    if [ "$_needs_nginx" = "true" ]; then
-        echo "  nginx config missing — reapplying..."
-        cd /data/voip && ./voip install-ui --quiet
-    else
-        echo "  nginx config unchanged — skipping."
-    fi
+    # Always re-run install-ui --quiet on update so the boot hook and
+    # voip-restore.service are refreshed even when nginx is already patched.
+    # install-ui is idempotent — it skips steps already done.
+    echo "  Refreshing boot hook and nginx config..."
+    cd /data/voip && ./voip install-ui --quiet
 
     echo "Update complete. voipd.conf preserved."
 }
