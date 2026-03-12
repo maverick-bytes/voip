@@ -111,19 +111,11 @@ const UninstallDialog = ({ onConfirm, onCancel }: UninstallDialogProps) => (
 const commands = [
   {
     id: "install",
-    label: "Install Service",
-    description: "Install and enable the voipd systemd service",
+    label: "Install / Reinstall Service",
+    description: "Install voipd and enable it as a systemd service. Run this again after a firmware upgrade — systemd service files don't survive firmware updates.",
     command: "cd /data/voip && ./voip install",
     icon: Download,
     variant: "install" as const,
-  },
-  {
-    id: "reinstall",
-    label: "Reinstall Service",
-    description: "Re-install after firmware upgrade (systemd files don't persist)",
-    command: "cd /data/voip && ./voip install",
-    icon: RefreshCw,
-    variant: "warning" as const,
   },
   {
     id: "update",
