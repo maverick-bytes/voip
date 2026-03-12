@@ -127,11 +127,10 @@ update_service() {
     _update_ui_bundle
 
     cd /data/voip && ./voip install
-    # Re-run install-ui to regenerate the nginx location config with the
-    # internal token. This is required when updating from a version that used
-    # the old single auth_request block (no X-Voip-Token) to the new split
-    # block model. The token file is preserved if it already exists.
-    ./voip install-ui
+    # Re-run install-ui --quiet to refresh server.py and nginx config.
+    # --quiet suppresses the "Web UI installed" banner since this is an update,
+    # not a fresh install. The token file is preserved if it already exists.
+    ./voip install-ui --quiet
     echo "Update complete. voipd.conf preserved."
 }
 
@@ -168,6 +167,10 @@ _update_ui_bundle() {
 # ── Install web UI ────────────────────────────────────────────────────────────
 
 install_ui() {
+    # --quiet: suppress the final "Web UI installed" banner (used by update_service)
+    local _quiet=false
+    [ "${1:-}" = "--quiet" ] && _quiet=true
+
     echo "Installing VoIP web UI..."
     mkdir -p "${UI_DIR}/dist"
 
@@ -221,14 +224,13 @@ WantedBy=multi-user.target"
     systemctl start  ${UI_SERVICE_NAME}
     nginx -s reload 2>/dev/null || true
 
-    echo ""
-    echo "Web UI installed. Access at:"
-    # Use the default IPv4 on br0 (LAN gateway) — more reliable than
-    # 'ip route get 1' which returns the WAN source IP on PPPoE setups.
-    _gw_ip=$(ip -o -4 addr show dev br0 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1)
-    [ -z "$_gw_ip" ] && _gw_ip=$(ip -o -4 addr show scope global 2>/dev/null | awk '!/^.*lo /{print $4}' | cut -d'/' -f1 | head -1)
-    echo "  https://${_gw_ip}/voip"
-    echo "  (Login with your UniFi OS credentials)"
+    if [ "$_quiet" = "false" ]; then
+        echo ""
+        echo "Web UI installed. Access at:"
+        _gw_ip=$(ip -o -4 addr show dev br0 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1)
+        [ -z "$_gw_ip" ] && _gw_ip=$(ip -o -4 addr show scope global 2>/dev/null | awk '!/^.*lo /{print $4}' | cut -d'/' -f1 | head -1)
+        echo "  https://${_gw_ip}/voip   (Login with your UniFi OS credentials)"
+    fi
 }
 
 # ── Uninstall web UI ──────────────────────────────────────────────────────────
