@@ -1,0 +1,16 @@
+[Unit]
+Description=VoIP Web UI for UniFiOS
+After=network.target voipd.service
+Wants=voipd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /data/voip/ui/server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voip-ui
+
+[Install]
+WantedBy=multi-user.target

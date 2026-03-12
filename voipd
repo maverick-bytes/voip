@@ -1,0 +1,777 @@
+#!/bin/sh
+# VoIP on UniFiOS — daemon
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# Two routing modes available — see ROUTING_MODE below:
+#
+#   pbr     (default) Policy-Based Routing.
+#                     Creates a dedicated routing table
+#                     and ip rules so IMS traffic always exits via voip,
+#                     regardless of UniFiOS default WAN priority.
+#
+#   forward           Forward VoIP traffic through a specific existing
+#                     interface/VLAN instead of the voip interface itself.
+#                     Use this if you want to steer traffic through a
+#                     different physical port or pre-existing VLAN.
+
+# ============================================================
+#  DEFAULTS — overridden by /data/voip/voipd.conf
+#  Do NOT edit here. Edit /data/voip/voipd.conf instead,
+#  or use the web UI at https://<gateway>/voip
+# ============================================================
+
+VOIP_WAN_INTERFACE="eth4"
+VOIP_WAN_VLAN="11"
+VOIP_WAN_VLAN_INTERFACE="voip"
+VOIP_WAN_VLAN_INTERFACE_EGRESS_QOS="0:5 1:5 2:5 3:5 4:5 5:5 6:5 7:5"
+PCSCF_HOSTNAME="p-cscf.example.com"
+ROUTING_MODE="pbr"
+VOIP_RT_TABLE="203"
+VOIP_RT_TABLE_NAME="voip"
+VOIP_FORWARD_INTERFACE=""
+VOIP_FORWARD_GATEWAY=""
+VOIP_IMS_SUBNET=""
+UBIOS_NAT_CHAIN="UBIOS_POSTROUTING_USER_HOOK"
+VOIP_STATE_DIR="/var/run/voipd"
+VOIP_DEBUG="false"
+
+# Source user configuration — overrides defaults above
+[ -f /data/voip/voipd.conf ] && . /data/voip/voipd.conf
+
+# ============================================================
+#  INTERNALS — do not edit below this line
+# ============================================================
+
+_debug() { [ "$VOIP_DEBUG" = "true" ] && echo "[DEBUG] $*" >&2; }
+
+# ── DHCP ──────────────────────────────────────────────────────────────────────
+
+_dhcp_start() {
+    echo "Starting DHCP on $VOIP_WAN_VLAN_INTERFACE via systemd-networkd"
+    mkdir -p "$VOIP_STATE_DIR"
+
+    cat > /etc/systemd/network/99-voip.network << NETEOF
+[Match]
+Name=$VOIP_WAN_VLAN_INTERFACE
+
+[Network]
+DHCP=ipv4
+LLMNR=no
+MulticastDNS=no
+
+[DHCP]
+UseDNS=true
+UseRoutes=false
+SendHostname=false
+NETEOF
+
+    systemctl restart systemd-networkd
+
+    echo "Waiting for DHCP lease..."
+    local waited=0
+    while [ $waited -lt 30 ]; do
+        ip addr show "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null | grep -q "inet " && break
+        sleep 1; waited=$((waited + 1))
+    done
+
+    if ip addr show "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null | grep -q "inet "; then
+        local got
+        got=$(ip addr show "$VOIP_WAN_VLAN_INTERFACE" | awk '/inet /{print $2}')
+        echo "DHCP OK: $got"
+    else
+        echo "ERROR: DHCP did not complete within 30s"
+        return 1
+    fi
+}
+
+_dhcp_stop() {
+    rm -f /etc/systemd/network/99-voip.network
+    systemctl restart systemd-networkd
+}
+
+# ── Subnet / IP detection ─────────────────────────────────────────────────────
+# Reads the IP assigned to the VoIP VLAN interface and derives the IMS subnet
+# to use for routing rules. Can be overridden via VOIP_IMS_SUBNET in voipd.conf.
+
+_detect_voip_config() {
+    local voip_cidr voip_ip o1
+
+    voip_cidr=$(ip addr show "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null \
+        | grep "inet " | awk '{print $2}' | head -1)
+    voip_ip=$(echo "$voip_cidr" | cut -d'/' -f1)
+
+    if [ -z "$voip_ip" ]; then
+        echo "ERROR: no IP on $VOIP_WAN_VLAN_INTERFACE"
+        return 1
+    fi
+
+    VOIP_IP="$voip_ip"
+    VOIP_CIDR="$voip_cidr"
+
+    if [ -n "$VOIP_IMS_SUBNET" ]; then
+        VOIP_DEST_SUBNET="$VOIP_IMS_SUBNET"
+        echo "  IMS subnet : $VOIP_DEST_SUBNET (manual override)"
+    else
+        o1=$(echo "$voip_ip" | cut -d'.' -f1)
+        case "$o1" in
+            10)  VOIP_DEST_SUBNET="10.0.0.0/8"      ;;
+            100) VOIP_DEST_SUBNET="100.64.0.0/10"   ;;
+            172) VOIP_DEST_SUBNET="172.16.0.0/12"   ;;
+            192) VOIP_DEST_SUBNET="192.168.0.0/16"  ;;
+            *)
+                echo "  WARNING: unknown first octet $o1, defaulting to 10.0.0.0/8"
+                VOIP_DEST_SUBNET="10.0.0.0/8"
+                ;;
+        esac
+        echo "  IMS subnet : $VOIP_DEST_SUBNET (auto from $voip_ip)"
+    fi
+
+    echo "$VOIP_DEST_SUBNET" > "$VOIP_STATE_DIR/subnet"
+    echo "$voip_ip"          > "$VOIP_STATE_DIR/voip_ip"
+    echo "  VoIP IP    : $voip_ip"
+}
+
+# ── Gateway detection ─────────────────────────────────────────────────────────
+# Tries multiple sources in order: systemd-networkd lease files, networkctl,
+# ip route, and finally a pure-shell network calculation as last resort.
+
+_calc_network_gateway() {
+    local ip="$1" prefix="$2"
+    local o1 o2 o3 o4 mask ip_int net_int gw_int n1 n2 n3 n4
+
+    o1=$(echo "$ip" | cut -d'.' -f1); o2=$(echo "$ip" | cut -d'.' -f2)
+    o3=$(echo "$ip" | cut -d'.' -f3); o4=$(echo "$ip" | cut -d'.' -f4)
+
+    if [ "$prefix" -ge 32 ]; then mask=4294967295
+    elif [ "$prefix" -le 0 ]; then mask=0
+    else
+        local shift=$((32 - prefix)) divisor=1 i=0
+        while [ $i -lt $shift ]; do divisor=$((divisor * 2)); i=$((i + 1)); done
+        mask=$(( (4294967295 / divisor) * divisor ))
+    fi
+
+    ip_int=$(( (o1*16777216) + (o2*65536) + (o3*256) + o4 ))
+    net_int=$(( ip_int & mask ))
+    gw_int=$(( net_int + 1 ))
+    n1=$(( (gw_int>>24)&255 )); n2=$(( (gw_int>>16)&255 ))
+    n3=$(( (gw_int>>8)&255  )); n4=$(( gw_int&255 ))
+    echo "${n1}.${n2}.${n3}.${n4}"
+}
+
+_get_gateway_for_iface() {
+    local iface="$1"
+    local gw iface_index
+
+    iface_index=$(ip link show "$iface" 2>/dev/null | awk -F': ' 'NR==1{print $1}')
+
+    for lease_dir in \
+        /run/systemd/netif/leases /run/systemd/network \
+        /run/systemd/netif /var/lib/systemd/network
+    do
+        [ -d "$lease_dir" ] || continue
+        for f in \
+            "$lease_dir/${iface_index}.lease" \
+            "$lease_dir/${iface}.lease" \
+            $(find "$lease_dir" -maxdepth 1 -name "*.lease" 2>/dev/null)
+        do
+            [ -f "$f" ] || continue
+            gw=$(grep "^ROUTER=" "$f" 2>/dev/null \
+                | cut -d'=' -f2 | tr ' ' '\n' \
+                | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+            [ -n "$gw" ] && echo "$gw" && return 0
+        done
+        if [ -n "$iface_index" ] && [ -f "$lease_dir/$iface_index" ]; then
+            gw=$(grep "^ROUTER=" "$lease_dir/$iface_index" 2>/dev/null \
+                | cut -d'=' -f2 | head -1)
+            [ -n "$gw" ] && echo "$gw" && return 0
+        fi
+    done
+
+    gw=$(networkctl status "$iface" 2>/dev/null \
+        | grep -i "gateway\|router" | awk '{print $NF}' \
+        | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+    [ -n "$gw" ] && echo "$gw" && return 0
+
+    gw=$(ip route show dev "$iface" 2>/dev/null | awk '/via/{print $3}' | head -1)
+    [ -n "$gw" ] && echo "$gw" && return 0
+
+    # Last resort: calculate network+1 from the interface CIDR
+    local cidr ip pfx
+    cidr=$(ip addr show "$iface" 2>/dev/null | grep "inet " | awk '{print $2}' | head -1)
+    if [ -n "$cidr" ]; then
+        ip=$(echo "$cidr" | cut -d'/' -f1)
+        pfx=$(echo "$cidr" | cut -d'/' -f2)
+        _calc_network_gateway "$ip" "$pfx"
+        return 0
+    fi
+
+    echo ""; return 1
+}
+
+# ── Bridge interface discovery ────────────────────────────────────────────────
+
+_get_lan_bridges() {
+    ip link show type bridge 2>/dev/null \
+        | awk -F': ' '/^[0-9]/{print $2}' \
+        | awk '{print $1}'
+}
+
+# ── WAN subinterface rp_filter helper ────────────────────────────────────────
+# UniFiOS creates subinterfaces on the WAN port for each WAN profile. Their
+# rp_filter blocks return traffic from the voip VLAN if left at default (1).
+
+_wan_subif_rp_set() {
+    local sub
+    for sub in $(ip link show 2>/dev/null \
+            | awk -F'[ :@]' "/@${VOIP_WAN_INTERFACE}[: ]/{print \$3}" \
+            | grep -v "^${VOIP_WAN_VLAN_INTERFACE}$"); do
+        [ -z "$sub" ] && continue
+        echo 0 > "/proc/sys/net/ipv4/conf/${sub}/rp_filter" 2>/dev/null || true
+        echo "  rp_filter  : disabled on $sub"
+    done
+}
+
+_wan_subif_rp_fix() {
+    local action="${1:-add}"
+    local sub
+
+    for sub in $(ip link show 2>/dev/null \
+            | awk -F'[ :@]' "/@${VOIP_WAN_INTERFACE}[: ]/{print \$3}" \
+            | grep -v "^${VOIP_WAN_VLAN_INTERFACE}$"); do
+        [ -z "$sub" ] && continue
+        if [ "$action" = "add" ]; then
+            iptables -C FORWARD -i "$sub" \
+                -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+                || iptables -I FORWARD 1 -i "$sub" \
+                    -m state --state RELATED,ESTABLISHED -j ACCEPT
+        else
+            iptables -D FORWARD -i "$sub" \
+                -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+        fi
+    done
+}
+
+# ── PBR routing ───────────────────────────────────────────────────────────────
+# Creates a dedicated routing table so IMS-bound traffic uses the VoIP
+# interface regardless of which WAN UniFiOS currently prefers.
+
+_routing_setup_pbr() {
+    local gw
+    gw=$(_get_gateway_for_iface "$VOIP_WAN_VLAN_INTERFACE")
+    [ -z "$gw" ] && echo "ERROR: cannot determine gateway" && return 1
+
+    echo "  Mode       : pbr (policy-based routing)"
+    echo "  Gateway    : $gw"
+    echo "$gw" > "$VOIP_STATE_DIR/gw"
+
+    # Register routing table name if not already present
+    grep -q "^$VOIP_RT_TABLE " /etc/iproute2/rt_tables 2>/dev/null \
+        || echo "$VOIP_RT_TABLE $VOIP_RT_TABLE_NAME" >> /etc/iproute2/rt_tables
+
+    # Flush any stale rules/routes from a previous run
+    ip rule del to   "$VOIP_DEST_SUBNET" priority 100 2>/dev/null || true
+    ip rule del from "$VOIP_IP"          priority 100 2>/dev/null || true
+    ip route flush table "$VOIP_RT_TABLE" 2>/dev/null || true
+    while iptables -t mangle -D PREROUTING \
+        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING \
+        -d "$VOIP_DEST_SUBNET" -j CONNMARK --save-mark --nfmask 0x7e0000 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING \
+        -m connmark --mark 0x1e0000/0x7e0000 \
+        -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null; do :; done
+
+    ip route add default via "$gw" dev "$VOIP_WAN_VLAN_INTERFACE" table "$VOIP_RT_TABLE"
+    echo "  Table $VOIP_RT_TABLE    : default via $gw dev $VOIP_WAN_VLAN_INTERFACE"
+
+    ip rule add to   "$VOIP_DEST_SUBNET" lookup "$VOIP_RT_TABLE" priority 100
+    ip rule add from "$VOIP_IP"          lookup "$VOIP_RT_TABLE" priority 100
+    echo "  Rules      : to $VOIP_DEST_SUBNET and from $VOIP_IP -> table $VOIP_RT_TABLE (priority 100)"
+
+    # MARK+CONNMARK save for new outbound packets to the IMS subnet.
+    # CONNMARK restore for ESTABLISHED reply packets — this keeps reply traffic
+    # on the voip routing table even if conntrack is briefly disrupted, which
+    # prevents mid-call audio muting when the watchdog restores rules.
+    iptables -t mangle -I PREROUTING 1 \
+        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark 0x1e0000/0x7e0000
+    iptables -t mangle -I PREROUTING 2 \
+        -d "$VOIP_DEST_SUBNET" -j CONNMARK --save-mark --nfmask 0x7e0000
+    iptables -t mangle -I PREROUTING 3 \
+        -m connmark --mark 0x1e0000/0x7e0000 \
+        -j CONNMARK --restore-mark --nfmask 0x7e0000
+    echo "  Mangle     : PREROUTING dst $VOIP_DEST_SUBNET -> MARK + CONNMARK save/restore"
+
+    iptables -t nat -C "$UBIOS_NAT_CHAIN" \
+        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A "$UBIOS_NAT_CHAIN" \
+        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE
+    echo "  NAT        : MASQUERADE in $UBIOS_NAT_CHAIN on $VOIP_WAN_VLAN_INTERFACE"
+
+    _wan_subif_rp_set
+    _wan_subif_rp_fix add
+
+    local br
+    for br in $(_get_lan_bridges); do
+        iptables -C FORWARD -i "$br" -o "$VOIP_WAN_VLAN_INTERFACE" -j ACCEPT 2>/dev/null \
+            || iptables -I FORWARD 1 -i "$br" -o "$VOIP_WAN_VLAN_INTERFACE" -j ACCEPT
+    done
+    iptables -C FORWARD -i "$VOIP_WAN_VLAN_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+        || iptables -I FORWARD 1 -i "$VOIP_WAN_VLAN_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    echo "  FORWARD    : LAN bridges -> $VOIP_WAN_VLAN_INTERFACE allowed"
+
+    iptables -C UBIOS_LAN_IN_USER -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
+        || iptables -I UBIOS_LAN_IN_USER 1 -d "$VOIP_DEST_SUBNET" -j ACCEPT
+    echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET"
+}
+
+_routing_teardown_pbr() {
+    local subnet voip_ip
+    subnet=$(cat  "$VOIP_STATE_DIR/subnet"  2>/dev/null || echo "10.0.0.0/8")
+    voip_ip=$(cat "$VOIP_STATE_DIR/voip_ip" 2>/dev/null || echo "")
+
+    ip rule del to "$subnet" priority 100              2>/dev/null || true
+    [ -n "$voip_ip" ] && \
+        ip rule del from "$voip_ip" priority 100       2>/dev/null || true
+    ip route flush table "$VOIP_RT_TABLE"               2>/dev/null || true
+
+    iptables -t mangle -D PREROUTING \
+        -d "$subnet" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null || true
+    iptables -t mangle -D PREROUTING \
+        -d "$subnet" -j CONNMARK --save-mark --nfmask 0x7e0000 2>/dev/null || true
+    iptables -t mangle -D PREROUTING \
+        -m connmark --mark 0x1e0000/0x7e0000 \
+        -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null || true
+    iptables -t nat -D "$UBIOS_NAT_CHAIN" \
+        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE 2>/dev/null || true
+
+    local br
+    for br in $(_get_lan_bridges); do
+        iptables -D FORWARD -i "$br" -o "$VOIP_WAN_VLAN_INTERFACE" -j ACCEPT 2>/dev/null || true
+    done
+    iptables -D FORWARD -i "$VOIP_WAN_VLAN_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    _wan_subif_rp_fix remove
+    iptables -D UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null || true
+    sed -i "/^$VOIP_RT_TABLE /d" /etc/iproute2/rt_tables 2>/dev/null || true
+}
+
+# ── Forward routing mode ──────────────────────────────────────────────────────
+# Instead of a dedicated VoIP VLAN, route IMS-bound traffic through an
+# existing interface (e.g. a pre-existing WAN VLAN managed by UniFiOS).
+
+_routing_setup_forward() {
+    if [ -z "$VOIP_FORWARD_INTERFACE" ]; then
+        echo "ERROR: ROUTING_MODE=forward but VOIP_FORWARD_INTERFACE is not set"
+        return 1
+    fi
+    if ! ip link show "$VOIP_FORWARD_INTERFACE" >/dev/null 2>&1; then
+        echo "ERROR: forward interface $VOIP_FORWARD_INTERFACE does not exist"
+        return 1
+    fi
+
+    local gw
+    if [ -n "$VOIP_FORWARD_GATEWAY" ]; then
+        gw="$VOIP_FORWARD_GATEWAY"
+    else
+        gw=$(_get_gateway_for_iface "$VOIP_FORWARD_INTERFACE")
+        [ -z "$gw" ] && echo "ERROR: cannot determine gateway for $VOIP_FORWARD_INTERFACE" && return 1
+    fi
+
+    echo "  Mode       : forward (via $VOIP_FORWARD_INTERFACE)"
+    echo "  Gateway    : $gw"
+    echo "$gw" > "$VOIP_STATE_DIR/gw"
+    echo "$VOIP_FORWARD_INTERFACE" > "$VOIP_STATE_DIR/forward_iface"
+
+    ip route del "$VOIP_DEST_SUBNET" 2>/dev/null || true
+    ip route add "$VOIP_DEST_SUBNET" via "$gw" dev "$VOIP_FORWARD_INTERFACE" metric 10
+    echo "  Route      : $VOIP_DEST_SUBNET via $gw dev $VOIP_FORWARD_INTERFACE (metric 10)"
+
+    iptables -t nat -C "$UBIOS_NAT_CHAIN" \
+        -o "$VOIP_FORWARD_INTERFACE" -d "$VOIP_DEST_SUBNET" -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A "$UBIOS_NAT_CHAIN" \
+        -o "$VOIP_FORWARD_INTERFACE" -d "$VOIP_DEST_SUBNET" -j MASQUERADE
+    echo "  NAT        : MASQUERADE in $UBIOS_NAT_CHAIN on $VOIP_FORWARD_INTERFACE"
+
+    local br
+    for br in $(_get_lan_bridges); do
+        iptables -C FORWARD -i "$br" -o "$VOIP_FORWARD_INTERFACE" -j ACCEPT 2>/dev/null \
+            || iptables -I FORWARD 1 -i "$br" -o "$VOIP_FORWARD_INTERFACE" -j ACCEPT
+    done
+    iptables -C FORWARD -i "$VOIP_FORWARD_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+        || iptables -I FORWARD 1 -i "$VOIP_FORWARD_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
+    echo "  FORWARD    : LAN bridges -> $VOIP_FORWARD_INTERFACE allowed"
+
+    iptables -C UBIOS_LAN_IN_USER -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
+        || iptables -I UBIOS_LAN_IN_USER 1 -d "$VOIP_DEST_SUBNET" -j ACCEPT
+    echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET"
+}
+
+_routing_teardown_forward() {
+    local subnet fwd_iface
+    subnet=$(cat    "$VOIP_STATE_DIR/subnet"        2>/dev/null || echo "10.0.0.0/8")
+    fwd_iface=$(cat "$VOIP_STATE_DIR/forward_iface" 2>/dev/null || echo "$VOIP_FORWARD_INTERFACE")
+
+    ip route del "$subnet" 2>/dev/null || true
+    iptables -t nat -D "$UBIOS_NAT_CHAIN" \
+        -o "$fwd_iface" -d "$subnet" -j MASQUERADE 2>/dev/null || true
+
+    local br
+    for br in $(_get_lan_bridges); do
+        iptables -D FORWARD -i "$br" -o "$fwd_iface" -j ACCEPT 2>/dev/null || true
+    done
+    iptables -D FORWARD -i "$fwd_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
+    iptables -D UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null || true
+}
+
+# ── Routing dispatcher ────────────────────────────────────────────────────────
+
+_routing_setup() {
+    # fresh=true  → called on initial start: flush conntrack + route cache
+    # fresh=false → called as a restore (e.g. from ip-monitor or watchdog):
+    #               skip conntrack flush to avoid disrupting active RTP calls
+    local fresh="${1:-true}"
+    echo "Setting up VoIP routing"
+    _detect_voip_config || return 1
+    case "$ROUTING_MODE" in
+        pbr)     _routing_setup_pbr     || return 1 ;;
+        forward) _routing_setup_forward || return 1 ;;
+        *) echo "ERROR: unknown ROUTING_MODE '$ROUTING_MODE'"; return 1 ;;
+    esac
+    if [ "$fresh" = "true" ]; then
+        # Fresh start only: flush conntrack so stale entries don't steer traffic
+        # through the old (pre-voip) path. Skipped on restore to avoid killing
+        # active RTP sessions (which causes mid-call audio muting).
+        conntrack -D --orig-dst  "$VOIP_DEST_SUBNET" 2>/dev/null || true
+        conntrack -D --reply-dst "$VOIP_DEST_SUBNET" 2>/dev/null || true
+    fi
+    ip route flush cache 2>/dev/null || true
+}
+
+_routing_teardown() {
+    echo "Removing VoIP routing"
+    case "$ROUTING_MODE" in
+        pbr)     _routing_teardown_pbr     ;;
+        forward) _routing_teardown_forward ;;
+    esac
+    ip route flush cache 2>/dev/null || true
+}
+
+# ── P-CSCF resolution ─────────────────────────────────────────────────────────
+# Resolves the ISP's SIP proxy hostname using DNS from the VoIP DHCP lease.
+# The resolved IP is saved to a state file and displayed in the status banner
+# so it can be pasted directly into a SIP client or ATA.
+
+_resolve_pcscf() {
+    [ -z "$PCSCF_HOSTNAME" ] && return 0
+    echo "Resolving $PCSCF_HOSTNAME..."
+    sleep 3
+
+    local pcscf_ip dns_server iface_index
+    iface_index=$(ip link show "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null \
+        | awk -F': ' 'NR==1{print $1}')
+
+    # Try to get the DNS server from the systemd-networkd lease for this interface
+    if [ -n "$iface_index" ] && [ -f "/run/systemd/netif/leases/$iface_index" ]; then
+        dns_server=$(grep "^DNS=" "/run/systemd/netif/leases/$iface_index" \
+            2>/dev/null | cut -d'=' -f2 | awk '{print $1}')
+    fi
+
+    # Fallback: find lease by IP address
+    if [ -z "$dns_server" ] && [ -n "$VOIP_IP" ]; then
+        local lf
+        lf=$(grep -rl "ADDRESS=$VOIP_IP" /run/systemd/netif/leases/ 2>/dev/null | head -1)
+        [ -n "$lf" ] && \
+            dns_server=$(grep "^DNS=" "$lf" 2>/dev/null | cut -d'=' -f2 | awk '{print $1}')
+    fi
+
+    # Fallback: ask resolvectl
+    [ -z "$dns_server" ] && \
+        dns_server=$(resolvectl dns "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null \
+            | sed 's/.*: //' | tr ' ' '\n' \
+            | grep -E '^[0-9]{1,3}\.' | head -1)
+
+    _debug "DNS: ${dns_server:-(not found)}"
+
+    # Try nslookup, then dig, then getent as progressively broader fallbacks
+    [ -n "$dns_server" ] && command -v nslookup >/dev/null 2>&1 && \
+        pcscf_ip=$(nslookup "$PCSCF_HOSTNAME" "$dns_server" 2>/dev/null \
+            | awk '/^Address:/{print $2}' | grep -Ev '#' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+
+    [ -z "$pcscf_ip" ] && [ -n "$dns_server" ] && command -v dig >/dev/null 2>&1 && \
+        pcscf_ip=$(dig @"$dns_server" +short +time=4 +tries=2 "$PCSCF_HOSTNAME" \
+            2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+
+    [ -z "$pcscf_ip" ] && command -v getent >/dev/null 2>&1 && \
+        pcscf_ip=$(getent hosts "$PCSCF_HOSTNAME" 2>/dev/null \
+            | awk '{print $1}' | head -1)
+
+    if [ -n "$pcscf_ip" ]; then
+        echo "  P-CSCF: $pcscf_ip"
+        echo "$pcscf_ip" > "$VOIP_STATE_DIR/pcscf_ip"
+    else
+        echo "  WARNING: could not resolve $PCSCF_HOSTNAME"
+        echo "(unresolved)" > "$VOIP_STATE_DIR/pcscf_ip"
+    fi
+}
+
+# ── Status ────────────────────────────────────────────────────────────────────
+
+_show_status() {
+    local voip_ip subnet pcscf_ip gw mode_info
+    voip_ip=$(cat  "$VOIP_STATE_DIR/voip_ip"  2>/dev/null || echo "unknown")
+    subnet=$(cat   "$VOIP_STATE_DIR/subnet"   2>/dev/null || echo "unknown")
+    pcscf_ip=$(cat "$VOIP_STATE_DIR/pcscf_ip" 2>/dev/null || echo "(unresolved)")
+    gw=$(cat       "$VOIP_STATE_DIR/gw"       2>/dev/null || echo "unknown")
+
+    case "$ROUTING_MODE" in
+        pbr)     mode_info="PBR -> table $VOIP_RT_TABLE ($VOIP_RT_TABLE_NAME)" ;;
+        forward) mode_info="Forward via $(cat $VOIP_STATE_DIR/forward_iface 2>/dev/null || echo $VOIP_FORWARD_INTERFACE)" ;;
+        *)       mode_info="$ROUTING_MODE" ;;
+    esac
+
+    echo ""
+    echo "=========================================================="
+    echo " VoIP -- Running"
+    echo "=========================================================="
+    echo "  Interface : $VOIP_WAN_VLAN_INTERFACE (VLAN $VOIP_WAN_VLAN on $VOIP_WAN_INTERFACE)"
+    echo "  VoIP IP   : $voip_ip"
+    echo "  Gateway   : $gw"
+    echo "  Routing   : $mode_info"
+    echo "  IMS subnet: $subnet"
+    echo "  NAT       : MASQUERADE in $UBIOS_NAT_CHAIN"
+    echo "----------------------------------------------------------"
+    if [ -z "$PCSCF_HOSTNAME" ]; then
+        echo "  SIP Proxy : PCSCF_HOSTNAME not set"
+    elif [ "$pcscf_ip" = "(unresolved)" ]; then
+        echo "  SIP Proxy : NOT RESOLVED -- check DNS via $VOIP_WAN_VLAN_INTERFACE"
+    else
+        echo "  SIP Proxy : $pcscf_ip  <-- use this in your SIP client / ATA"
+    fi
+    echo "=========================================================="
+    echo ""
+
+    systemd-notify --no-block \
+        "STATUS=VoIP UP | $voip_ip | P-CSCF: $pcscf_ip | mode: $ROUTING_MODE" \
+        2>/dev/null || true
+}
+
+# ── Network setup / teardown ──────────────────────────────────────────────────
+
+_network_setup() {
+    ip link show "$VOIP_WAN_INTERFACE" >/dev/null 2>&1 \
+        || { echo "ERROR: $VOIP_WAN_INTERFACE not found"; return 1; }
+
+    echo "  Conntrack  : flushing stale IMS entries"
+    local flush_subnet="${VOIP_IMS_SUBNET:-10.0.0.0/8}"
+    conntrack -D --orig-dst "$flush_subnet" 2>/dev/null || true
+    conntrack -D --reply-dst "$flush_subnet" 2>/dev/null || true
+    ip route flush cache 2>/dev/null || true
+
+    if [ -e "/sys/class/net/$VOIP_WAN_VLAN_INTERFACE" ]; then
+        echo "$VOIP_WAN_VLAN_INTERFACE already exists, removing first"
+        ip link delete dev "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null || true
+    fi
+
+    ip link add link "$VOIP_WAN_INTERFACE" name "$VOIP_WAN_VLAN_INTERFACE" \
+        type vlan id "$VOIP_WAN_VLAN"
+    [ -n "$VOIP_WAN_VLAN_INTERFACE_EGRESS_QOS" ] && \
+        ip link set "$VOIP_WAN_VLAN_INTERFACE" type vlan \
+            egress $VOIP_WAN_VLAN_INTERFACE_EGRESS_QOS
+    ip link set dev "$VOIP_WAN_VLAN_INTERFACE" up
+
+    _dhcp_start    || return 1
+    _routing_setup || return 1
+}
+
+_network_teardown() {
+    _routing_teardown
+    _dhcp_stop
+    ip link delete dev "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null || true
+}
+
+# ── Rules watchdog ────────────────────────────────────────────────────────────
+# UniFiOS occasionally rewrites iptables rules (e.g. after WAN failover or
+# network reconfiguration). This function re-instates any missing rules and
+# is called both once after startup and every 5 seconds in the main loop.
+# A lock directory prevents concurrent executions.
+
+_rules_ensure() {
+    local iface="$1" subnet="$2" mode="$3"
+    local _lock="$VOIP_STATE_DIR/rules.lock"
+
+    if ! mkdir "$_lock" 2>/dev/null; then return 0; fi
+    trap 'rm -rf "$_lock"' EXIT INT TERM
+
+    if [ "$mode" = "pbr" ]; then
+        iptables -t nat -C "$UBIOS_NAT_CHAIN" \
+            -o "$iface" -j MASQUERADE 2>/dev/null \
+        || { iptables -t nat -A "$UBIOS_NAT_CHAIN" -o "$iface" -j MASQUERADE
+             echo "  [watchdog] restored MASQUERADE on $iface"; }
+    else
+        iptables -t nat -C "$UBIOS_NAT_CHAIN" \
+            -o "$iface" -d "$subnet" -j MASQUERADE 2>/dev/null \
+        || { iptables -t nat -A "$UBIOS_NAT_CHAIN" -o "$iface" -d "$subnet" -j MASQUERADE
+             echo "  [watchdog] restored MASQUERADE on $iface dst $subnet"; }
+    fi
+
+    local br
+    for br in $(_get_lan_bridges); do
+        iptables -C FORWARD -i "$br" -o "$iface" -j ACCEPT 2>/dev/null \
+        || { iptables -I FORWARD 1 -i "$br" -o "$iface" -j ACCEPT
+             echo "  [watchdog] restored FORWARD $br -> $iface"; }
+    done
+
+    iptables -C FORWARD -i "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null \
+    || { iptables -I FORWARD 1 -i "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT
+         echo "  [watchdog] restored FORWARD $iface -> LAN (RELATED,ESTABLISHED)"; }
+    _wan_subif_rp_fix add
+
+    iptables -C UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null \
+    || { iptables -I UBIOS_LAN_IN_USER 1 -d "$subnet" -j ACCEPT
+         echo "  [watchdog] restored UBIOS_LAN_IN_USER ACCEPT dst $subnet"; }
+
+    if [ "$mode" = "pbr" ]; then
+        iptables -t mangle -C PREROUTING \
+            -d "$subnet" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null \
+        || { iptables -t mangle -I PREROUTING 1 \
+                 -d "$subnet" -j MARK --set-xmark 0x1e0000/0x7e0000
+             iptables -t mangle -I PREROUTING 2 \
+                 -d "$subnet" -j CONNMARK --save-mark --nfmask 0x7e0000
+             echo "  [watchdog] restored mangle MARK/CONNMARK for $subnet"; }
+        # Always ensure CONNMARK restore rule — this is the key fix for mid-call
+        # audio muting: reply packets from the IMS regain their routing mark
+        # from conntrack even if the MARK rule was briefly missing.
+        iptables -t mangle -C PREROUTING \
+            -m connmark --mark 0x1e0000/0x7e0000 \
+            -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null \
+        || { iptables -t mangle -I PREROUTING 3 \
+                 -m connmark --mark 0x1e0000/0x7e0000 \
+                 -j CONNMARK --restore-mark --nfmask 0x7e0000
+             echo "  [watchdog] restored mangle CONNMARK restore for $subnet"; }
+    fi
+
+    rm -rf "$_lock"
+    trap - EXIT INT TERM
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+[ $# -eq 0 ] && echo "Usage: $0 {start|stop|status}" && exit 1
+
+case $1 in
+    start)
+        mkdir -p "$VOIP_STATE_DIR"
+        _network_setup || { echo "FATAL: network setup failed"; exit 1; }
+        _resolve_pcscf
+        _show_status
+        echo "VoIP service started (mode: $ROUTING_MODE)"
+
+        # Give UniFiOS a few seconds to finish its own post-boot network work
+        # before we verify rules, to avoid a race with its iptables restore.
+        echo "Waiting for UniFiOS to settle (3s)..."
+        sleep 3
+        _rules_ensure \
+            "$VOIP_WAN_VLAN_INTERFACE" \
+            "$(cat $VOIP_STATE_DIR/subnet 2>/dev/null || echo ${VOIP_IMS_SUBNET:-10.0.0.0/8})" \
+            "$ROUTING_MODE"
+        echo "Rules confirmed (post-settle)."
+
+        echo "down" > "$VOIP_STATE_DIR/link_state"
+        echo "up"   > "$VOIP_STATE_DIR/link_state"
+        (
+            # Monitor link and address events. On WAN link recovery, tear down
+            # and rebuild the VoIP stack so a fresh DHCP lease is obtained.
+            ip monitor link address 2>/dev/null | while IFS= read -r _evt; do
+                if echo "$_evt" | grep -q ": ${VOIP_WAN_INTERFACE}:"; then
+                    if echo "$_evt" | grep -qE "state (DOWN|UNKNOWN)|Deleted"; then
+                        echo "[ip-monitor] $VOIP_WAN_INTERFACE DOWN"
+                        echo "down" > "$VOIP_STATE_DIR/link_state"
+                    elif echo "$_evt" | grep -q "state UP"; then
+                        if [ "$(cat $VOIP_STATE_DIR/link_state 2>/dev/null)" = "down" ]; then
+                            echo "[ip-monitor] $VOIP_WAN_INTERFACE UP — waiting 4s for link to settle"
+                            echo "up" > "$VOIP_STATE_DIR/link_state"
+                            sleep 4
+                            conntrack -D --orig-dst "${VOIP_IMS_SUBNET:-10.0.0.0/8}" 2>/dev/null || true
+                            conntrack -D --reply-dst "${VOIP_IMS_SUBNET:-10.0.0.0/8}" 2>/dev/null || true
+                            _network_setup || { echo "[ip-monitor] ERROR: setup failed"; continue; }
+                            sleep 3
+                            _rules_ensure \
+                                "$VOIP_WAN_VLAN_INTERFACE" \
+                                "$(cat $VOIP_STATE_DIR/subnet 2>/dev/null || echo ${VOIP_IMS_SUBNET:-10.0.0.0/8})" \
+                                "$ROUTING_MODE"
+                            _resolve_pcscf
+                            _show_status
+                            echo "[ip-monitor] $VOIP_WAN_INTERFACE link recovery complete"
+                        fi
+                    fi
+                fi
+
+                # A WAN subinterface coming UP after a toggle needs rp_filter cleared
+                if echo "$_evt" | grep -q "@${VOIP_WAN_INTERFACE}" && \
+                   echo "$_evt" | grep -q "state UP" && \
+                   ! echo "$_evt" | grep -qw "$VOIP_WAN_VLAN_INTERFACE"; then
+                    _sub=$(echo "$_evt" | awk -F'[ :@]' '{for(i=1;i<=NF;i++) if($i~/^[a-z]/ && $i!~/state/) {print $i; exit}}')
+                    if [ -n "$_sub" ] && [ "$_sub" != "$VOIP_WAN_VLAN_INTERFACE" ]; then
+                        echo 0 > "/proc/sys/net/ipv4/conf/${_sub}/rp_filter" 2>/dev/null || true
+                        echo "[ip-monitor] rp_filter=0 on $_sub (WAN subif UP after toggle)"
+                    fi
+                fi
+
+                # voip interface address event — re-check routing table and rules
+                if echo "$_evt" | grep -qw "$VOIP_WAN_VLAN_INTERFACE" && \
+                   ! echo "$_evt" | grep -q "Deleted"; then
+                    sleep 2
+                    if ! ip route show table "$VOIP_RT_TABLE" 2>/dev/null | grep -q .; then
+                        echo "[ip-monitor] table $VOIP_RT_TABLE empty — restoring routing after eth4 toggle"
+                        _routing_setup "false" \
+                            && echo "[ip-monitor] routing restored (table $VOIP_RT_TABLE OK)" \
+                            || echo "[ip-monitor] ERROR: routing restore failed"
+                        sleep 3
+                    else
+                        echo "[ip-monitor] voip address event — re-ensuring rules"
+                    fi
+                    _rules_ensure \
+                        "$VOIP_WAN_VLAN_INTERFACE" \
+                        "$(cat $VOIP_STATE_DIR/subnet 2>/dev/null || echo ${VOIP_IMS_SUBNET:-10.0.0.0/8})" \
+                        "$ROUTING_MODE"
+                fi
+            done
+        ) &
+        echo $! > "$VOIP_STATE_DIR/monitor_pid"
+        echo "ip monitor started (PID $(cat $VOIP_STATE_DIR/monitor_pid))"
+
+        # Main watchdog loop — re-ensures rules every 5 seconds
+        while true; do
+            sleep 5
+            _rules_ensure \
+                "$([ "$ROUTING_MODE" = "pbr" ] \
+                    && echo "$VOIP_WAN_VLAN_INTERFACE" \
+                    || cat "$VOIP_STATE_DIR/forward_iface" 2>/dev/null \
+                    || echo "$VOIP_FORWARD_INTERFACE")" \
+                "$(cat "$VOIP_STATE_DIR/subnet" 2>/dev/null \
+                    || echo "${VOIP_IMS_SUBNET:-10.0.0.0/8}")" \
+                "$ROUTING_MODE"
+        done
+        ;;
+    stop)
+        if [ -f "$VOIP_STATE_DIR/monitor_pid" ]; then
+            kill "$(cat $VOIP_STATE_DIR/monitor_pid)" 2>/dev/null || true
+            rm -f "$VOIP_STATE_DIR/monitor_pid"
+        fi
+        _network_teardown
+        rm -f "$VOIP_STATE_DIR/subnet"  "$VOIP_STATE_DIR/voip_ip" \
+              "$VOIP_STATE_DIR/gw"      "$VOIP_STATE_DIR/pcscf_ip" \
+              "$VOIP_STATE_DIR/forward_iface" "$VOIP_STATE_DIR/link_state"
+        echo "VoIP service stopped"
+        ;;
+    status)
+        _show_status
+        ;;
+    *)
+        echo "Usage: $0 {start|stop|status}"
+        exit 1
+        ;;
+esac

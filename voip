@@ -1,0 +1,421 @@
+#!/bin/sh
+# voip — VoIP service manager for UniFiOS
+# Install, uninstall, and update the voipd daemon and web UI.
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+
+set -e
+
+SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
+DAEMON_SCRIPT="voipd"
+SERVICE_NAME="voipd"
+SERVICE_FILE="${SERVICE_NAME}.service"
+CONF_FILE="/data/voip/voipd.conf"
+UI_DIR="/data/voip/ui"
+UI_SERVICE_NAME="voip-ui"
+UI_SERVICE_FILE="${UI_SERVICE_NAME}.service"
+GITHUB_REPO="maverick-bytes/voip"
+GITHUB_BASE="https://github.com/${GITHUB_REPO}"
+
+# UniFi OS nginx paths — conf.d is NOT read; location blocks must be injected
+# into the main site config via a persistent include line.
+NGINX_SITE_CONF="/data/unifi-core/config/http/site-local-ip.conf"
+NGINX_LOC_CONF="/data/unifi-core/config/http/voip-location.conf"
+NGINX_MARKER="# voip-ui include"
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Error: This script must be run as root" >&2
+    exit 1
+fi
+
+# ── Routing table auto-detection ─────────────────────────────────────────────
+# Reads /etc/iproute2/rt_tables and finds the highest non-system table number
+# (excluding reserved 0/253/254/255), then returns max+1. This avoids
+# collisions with UniFiOS WAN tables (201 = WAN1, 202 = WAN2, 203 = WAN3...).
+
+_detect_rt_table() {
+    local highest
+    highest=$(grep -E '^[0-9]+' /etc/iproute2/rt_tables 2>/dev/null \
+        | awk '{print $1}' \
+        | grep -vE '^(0|253|254|255)$' \
+        | sort -n | tail -1)
+    if [ -z "$highest" ] || [ "$highest" -lt 200 ]; then
+        highest=202
+    fi
+    echo $((highest + 1))
+}
+
+# ── Create voipd.conf from example if not already present ────────────────────
+
+_create_config() {
+    if [ -f "$CONF_FILE" ]; then
+        echo "Configuration already exists at $CONF_FILE — skipping"
+        return 0
+    fi
+    echo "Creating default configuration at $CONF_FILE ..."
+    local rt_table
+    rt_table=$(_detect_rt_table)
+    echo "  Auto-detected routing table: $rt_table"
+    cp "${SCRIPT_DIR}/voipd.conf.example" "$CONF_FILE"
+    sed -i "s/^VOIP_RT_TABLE=.*/VOIP_RT_TABLE=\"${rt_table}\"/" "$CONF_FILE"
+    echo "  Done. Edit $CONF_FILE or use the web UI at https://<gateway>/voip"
+}
+
+# ── Install voipd ─────────────────────────────────────────────────────────────
+
+install_service() {
+    echo "Installing VoIP service..."
+    [ ! -f "${SCRIPT_DIR}/${DAEMON_SCRIPT}" ] && echo "Error: ${DAEMON_SCRIPT} not found" >&2 && exit 1
+    [ ! -f "${SCRIPT_DIR}/${SERVICE_FILE}" ]  && echo "Error: ${SERVICE_FILE} not found"  >&2 && exit 1
+
+    cp "${SCRIPT_DIR}/${DAEMON_SCRIPT}" /usr/local/bin/
+    chmod +x /usr/local/bin/${DAEMON_SCRIPT}
+    echo "  Daemon installed to /usr/local/bin/${DAEMON_SCRIPT}"
+
+    cp "${SCRIPT_DIR}/${SERVICE_FILE}" /lib/systemd/system/
+    echo "  Service file installed to /lib/systemd/system/${SERVICE_FILE}"
+
+    _create_config
+
+    systemctl daemon-reload
+    systemctl enable ${SERVICE_NAME}
+    systemctl start  ${SERVICE_NAME}
+
+    echo "VoIP service installed and started."
+    echo "  Status: systemctl status ${SERVICE_NAME}"
+    echo "  Logs:   journalctl -u ${SERVICE_NAME} -f"
+}
+
+# ── Uninstall voipd ───────────────────────────────────────────────────────────
+
+uninstall_service() {
+    echo "Uninstalling VoIP daemon..."
+    systemctl stop    ${SERVICE_NAME} 2>/dev/null || true
+    systemctl disable ${SERVICE_NAME} 2>/dev/null || true
+    rm -f /lib/systemd/system/${SERVICE_FILE}
+    rm -f /usr/local/bin/${DAEMON_SCRIPT}
+    systemctl daemon-reload
+    echo "voipd removed. voipd.conf and UI are preserved."
+    echo "  To also remove the web UI: ./voip uninstall-ui"
+    echo "  To remove everything:      ./voip uninstall-ui && rm -rf /data/voip"
+}
+
+# ── Update from GitHub ────────────────────────────────────────────────────────
+
+update_service() {
+    echo "Updating VoIP service from GitHub..."
+    cd /data
+
+    curl -sL "${GITHUB_BASE}/archive/refs/heads/main.tar.gz" | tar -xz
+    mv voip-main voip-update-tmp
+
+    cp voip-update-tmp/voipd           /data/voip/voipd
+    cp voip-update-tmp/voip            /data/voip/voip
+    cp voip-update-tmp/voipd.service   /data/voip/voipd.service
+    cp voip-update-tmp/uninstall.sh    /data/voip/uninstall.sh
+    [ -f voip-update-tmp/voipd.conf.example ] && \
+        cp voip-update-tmp/voipd.conf.example /data/voip/voipd.conf.example
+    [ -d voip-update-tmp/ui ] && \
+        cp -r voip-update-tmp/ui/. /data/voip/ui/ 2>/dev/null || true
+
+    chmod +x /data/voip/voipd /data/voip/voip /data/voip/uninstall.sh
+    rm -rf /data/voip-update-tmp
+
+    _update_ui_bundle
+
+    cd /data/voip && ./voip install
+    # Re-run install-ui to regenerate the nginx location config with the
+    # internal token. This is required when updating from a version that used
+    # the old single auth_request block (no X-Voip-Token) to the new split
+    # block model. The token file is preserved if it already exists.
+    ./voip install-ui
+    echo "Update complete. voipd.conf preserved."
+}
+
+# ── Download UI bundle from GitHub Releases ───────────────────────────────────
+
+_update_ui_bundle() {
+    local release_url asset_url tag
+    release_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
+    echo "Checking for UI bundle update..."
+    local release_json
+    release_json=$(curl -sL "$release_url" 2>/dev/null)
+    tag=$(echo "$release_json" | grep '"tag_name"' | cut -d'"' -f4 | head -1)
+    asset_url=$(echo "$release_json" \
+        | grep '"browser_download_url"' \
+        | grep 'ui-dist.tar.gz' \
+        | cut -d'"' -f4 | head -1)
+    if [ -z "$asset_url" ]; then
+        echo "  No UI bundle in latest release — skipping"
+        return 0
+    fi
+    # Skip download if we already have this version
+    local version_file="${UI_DIR}/.ui-version"
+    if [ -f "$version_file" ] && [ "$(cat "$version_file" 2>/dev/null)" = "$tag" ]; then
+        echo "  UI bundle already at ${tag} — skipping download"
+        return 0
+    fi
+    echo "  Downloading UI bundle ${tag}..."
+    mkdir -p "${UI_DIR}/dist"
+    curl -sL "$asset_url" | tar -xz -C "${UI_DIR}/dist"
+    echo "$tag" > "$version_file"
+    echo "  UI bundle updated to ${tag}."
+}
+
+# ── Install web UI ────────────────────────────────────────────────────────────
+
+install_ui() {
+    echo "Installing VoIP web UI..."
+    mkdir -p "${UI_DIR}/dist"
+
+    if [ -f "${SCRIPT_DIR}/ui/server.py" ]; then
+        _src="${SCRIPT_DIR}/ui/server.py"
+        _dst="${UI_DIR}/server.py"
+        if [ "$(realpath "$_src" 2>/dev/null || echo "$_src")" != \
+             "$(realpath "$_dst" 2>/dev/null || echo "$_dst")" ]; then
+            cp "$_src" "$_dst"
+        fi
+        chmod +x "${UI_DIR}/server.py"
+        echo "  API server → ${UI_DIR}/server.py"
+    else
+        echo "Error: ui/server.py not found in ${SCRIPT_DIR}" >&2; exit 1
+    fi
+
+    _update_ui_bundle
+
+    # Install the service unit into BOTH /lib/systemd/system/ (active now) AND
+    # /etc/systemd/system/ (persistent across reboots on UCG-Fiber).
+    # /lib/systemd/system/ is a volatile tmpfs wiped on every reboot; the copy
+    # in /etc/systemd/system/ survives and is used directly on next boot.
+    _svc_content=""
+    if [ -f "${SCRIPT_DIR}/ui/${UI_SERVICE_FILE}" ]; then
+        _svc_content=$(cat "${SCRIPT_DIR}/ui/${UI_SERVICE_FILE}")
+    else
+        _svc_content="[Unit]
+Description=VoIP Web UI for UniFiOS
+After=network.target voipd.service
+Wants=voipd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /data/voip/ui/server.py
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=voip-ui
+
+[Install]
+WantedBy=multi-user.target"
+    fi
+    echo "$_svc_content" > /lib/systemd/system/${UI_SERVICE_FILE}
+    echo "$_svc_content" > /etc/systemd/system/${UI_SERVICE_FILE}
+
+    _nginx_install
+
+    systemctl daemon-reload
+    systemctl enable ${UI_SERVICE_NAME}
+    systemctl start  ${UI_SERVICE_NAME}
+    nginx -s reload 2>/dev/null || true
+
+    echo ""
+    echo "Web UI installed. Access at:"
+    # Use the default IPv4 on br0 (LAN gateway) — more reliable than
+    # 'ip route get 1' which returns the WAN source IP on PPPoE setups.
+    _gw_ip=$(ip -o -4 addr show dev br0 2>/dev/null | awk '{print $4}' | cut -d'/' -f1 | head -1)
+    [ -z "$_gw_ip" ] && _gw_ip=$(ip -o -4 addr show scope global 2>/dev/null | awk '!/^.*lo /{print $4}' | cut -d'/' -f1 | head -1)
+    echo "  https://${_gw_ip}/voip"
+    echo "  (Login with your UniFi OS credentials)"
+}
+
+# ── Uninstall web UI ──────────────────────────────────────────────────────────
+
+uninstall_ui() {
+    echo "Uninstalling VoIP web UI..."
+    systemctl stop    ${UI_SERVICE_NAME} 2>/dev/null || true
+    systemctl disable ${UI_SERVICE_NAME} 2>/dev/null || true
+    rm -f /lib/systemd/system/${UI_SERVICE_FILE}
+    rm -f /etc/systemd/system/${UI_SERVICE_FILE}
+    rm -f /etc/systemd/system/multi-user.target.wants/${UI_SERVICE_FILE}
+    _nginx_uninstall
+    systemctl daemon-reload
+    nginx -s reload 2>/dev/null || true
+    echo "Web UI removed. /data/voip and voipd.conf preserved."
+}
+
+# ── nginx: inject location block into UniFi OS site config ───────────────────
+# UniFi OS nginx only reads site-*.conf from /data/unifi-core/config/http/.
+# Those files are included at the http{} level and contain full server{} blocks.
+# To add a location to the main 443 server we:
+#   1. Write our location block to voip-location.conf (persistent in /data/)
+#   2. Inject a single include line into site-local-ip.conf right after the
+#      shared-post-setup-server.conf include that already lives in the 443 block.
+# The include line is idempotent — install-ui can be run multiple times safely.
+# A boot hook re-applies the patch after firmware upgrades restore the file.
+
+_nginx_install() {
+    local boot_hook="/data/on_boot.d/99-voip-nginx.sh"
+    echo "  Configuring nginx..."
+
+    # Write the location blocks.
+    #
+    # Security model:
+    #   /voip      — UI only, gated by UniFi OS session (auth_request).
+    #                Loads the React SPA. GET only in practice.
+    #   /voip/api/ — API routes. UniFi's auth_request blocks POST because
+    #                the session cookie is HttpOnly so JS cannot read the
+    #                CSRF token. Instead we use an nginx-injected internal
+    #                header X-Voip-Token with a secret written into this
+    #                config at install time. nginx proxy_set_header
+    #                OVERWRITES any client-supplied value so the secret
+    #                cannot be forged from outside. The Python backend
+    #                validates this header and rejects requests without it.
+    #                The backend also only binds to 127.0.0.1 so direct
+    #                access bypassing nginx is impossible.
+    local _secret
+    _secret=$(cat /data/voip/ui/.internal-token 2>/dev/null || true)
+    if [ -z "$_secret" ]; then
+        # Generate 32 random bytes as hex — busybox + GNU compatible
+        _secret=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null \
+            | od -A n -t x1 2>/dev/null | tr -d ' \n') || true
+        # Fallback: /dev/urandom read char by char via xxd or hexdump if od failed
+        [ -z "$_secret" ] && command -v xxd >/dev/null 2>&1 && \
+            _secret=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | xxd -p | tr -d '\n') || true
+        [ -z "$_secret" ] && \
+            _secret=$(dd if=/dev/urandom bs=32 count=1 2>/dev/null | hexdump -v -e '/1 "%02x"' 2>/dev/null) || true
+        # Last resort: use awk PRNG (always available, even on busybox)
+        [ -z "$_secret" ] && \
+            _secret=$(awk 'BEGIN{srand(); s=""; for(i=0;i<64;i++) s=s sprintf("%x", int(rand()*16)); print s}') || true
+        echo "  Generating auth token..."
+        echo "$_secret" > /data/voip/ui/.internal-token
+        chmod 600 /data/voip/ui/.internal-token
+    fi
+    echo "  Writing nginx location config..."
+    cat > "${NGINX_LOC_CONF}" << LOCEOF
+# VoIP Control Panel — managed by ./voip install-ui
+
+# API routes: secured by nginx-injected internal token (see voip script).
+# The token is written to /data/voip/ui/.internal-token at install time.
+# proxy_set_header overwrites any client-supplied X-Voip-Token header so
+# this cannot be forged from outside, even via VPN/Teleport.
+location /voip/api/ {
+    proxy_pass http://127.0.0.1:8099;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_set_header X-Voip-Token ${_secret};
+    proxy_read_timeout 120s;
+}
+
+# UI entry point: gated by UniFi OS session.
+location /voip {
+    auth_request /internal/auth/public-api;
+    error_page 401 = @voip_unauth;
+    proxy_pass http://127.0.0.1:8099;
+    proxy_http_version 1.1;
+    proxy_set_header Host \$host;
+    proxy_set_header X-Real-IP \$remote_addr;
+    proxy_read_timeout 120s;
+}
+
+location @voip_unauth {
+    return 302 https://\$host/;
+}
+LOCEOF
+    echo "  Location config → ${NGINX_LOC_CONF}"
+
+    # Inject include into site-local-ip.conf (idempotent).
+    # Uses a busybox-compatible approach — no GNU sed extensions.
+    if ! grep -q "${NGINX_MARKER}" "${NGINX_SITE_CONF}" 2>/dev/null; then
+        cp "${NGINX_SITE_CONF}" "${NGINX_SITE_CONF}.voip-bak"
+        # Build the two lines to insert, then splice them in with awk.
+        # awk is available on all busybox/GNU systems; GNU sed a\ with \n is not.
+        awk -v marker="    ${NGINX_MARKER}" \
+            -v inc="    include ${NGINX_LOC_CONF};" \
+            '/include.*shared-post-setup-server\.conf/{print; print marker; print inc; next} {print}' \
+            "${NGINX_SITE_CONF}.voip-bak" > "${NGINX_SITE_CONF}"
+        echo "  Patched ${NGINX_SITE_CONF}"
+    else
+        echo "  ${NGINX_SITE_CONF} already patched — skipping"
+    fi
+
+    # Boot hook: re-apply nginx patch AND restart services after firmware upgrades.
+    # /lib/systemd/system/ is a volatile tmpfs on UCG-Fiber — it gets wiped on
+    # every reboot. The hook reinstalls both service files and restarts them
+    # before reloading nginx, so the UI is always available after reboot.
+    mkdir -p /data/on_boot.d
+    cat > "${boot_hook}" << BOOTEOF
+#!/bin/sh
+# Restore VoIP UI after firmware upgrade / reboot
+# /lib/systemd/system/ is volatile on UCG-Fiber — reinstall service files.
+SITE="${NGINX_SITE_CONF}"
+MARKER="${NGINX_MARKER}"
+LOC="${NGINX_LOC_CONF}"
+SVC_DIR="/lib/systemd/system"
+
+# Reinstall voipd service if missing
+if [ ! -f "\$SVC_DIR/voipd.service" ] && [ -f /data/voip/voipd.service ]; then
+    cp /data/voip/voipd.service "\$SVC_DIR/"
+fi
+
+# Reinstall voip-ui service if missing
+if [ ! -f "\$SVC_DIR/voip-ui.service" ] && [ -f /data/voip/ui/voip-ui.service ]; then
+    cp /data/voip/ui/voip-ui.service "\$SVC_DIR/"
+fi
+
+systemctl daemon-reload 2>/dev/null || true
+systemctl enable voipd   2>/dev/null || true
+systemctl enable voip-ui 2>/dev/null || true
+systemctl start  voipd   2>/dev/null || true
+systemctl start  voip-ui 2>/dev/null || true
+
+# Re-patch nginx site config if needed
+if ! grep -q "\$MARKER" "\$SITE" 2>/dev/null; then
+    cp "\$SITE" "\$SITE.voip-bak"
+    awk -v marker="    \$MARKER" -v inc="    include \$LOC;" \
+        '/include.*shared-post-setup-server\.conf/{print; print marker; print inc; next} {print}' \
+        "\$SITE.voip-bak" > "\$SITE"
+fi
+nginx -s reload 2>/dev/null || true
+BOOTEOF
+    chmod +x "${boot_hook}"
+    echo "  Boot hook → ${boot_hook}"
+}
+
+# ── nginx: remove location block ─────────────────────────────────────────────
+
+_nginx_uninstall() {
+    # Remove our include line (and the marker) from site-local-ip.conf.
+    # Use awk (busybox-compatible) instead of sed -i with pattern deletion,
+    # which fails on busybox when the pattern contains slashes.
+    if grep -q "${NGINX_MARKER}" "${NGINX_SITE_CONF}" 2>/dev/null; then
+        cp "${NGINX_SITE_CONF}" "${NGINX_SITE_CONF}.voip-bak-rm"
+        awk -v marker="${NGINX_MARKER}" \
+            -v inc="include ${NGINX_LOC_CONF}" \
+            '($0 ~ marker) || ($0 ~ inc) {next} {print}' \
+            "${NGINX_SITE_CONF}.voip-bak-rm" > "${NGINX_SITE_CONF}"
+        echo "  Removed patch from ${NGINX_SITE_CONF}"
+    fi
+    rm -f "${NGINX_LOC_CONF}"
+    rm -f /data/on_boot.d/99-voip-nginx.sh
+    # Clean up old conf.d file if it exists from a previous install attempt
+    rm -f /etc/nginx/conf.d/voip-ui.conf
+    echo "  nginx config removed"
+}
+
+# ── Entry point ───────────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    install)      install_service ;;
+    uninstall)    uninstall_service ;;
+    update)       update_service ;;
+    install-ui)   install_ui ;;
+    uninstall-ui) uninstall_ui ;;
+    *)
+        echo "Usage: $0 {install|uninstall|update|install-ui|uninstall-ui}" >&2
+        exit 1
+        ;;
+esac

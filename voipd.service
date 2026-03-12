@@ -1,0 +1,13 @@
+[Unit]
+Description=VoIP support for UniFi
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/voipd start
+ExecStop=/usr/local/bin/voipd stop
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,158 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+
+@layer base {
+  :root {
+    --background: 210 20% 98%;
+    --foreground: 220 20% 10%;
+
+    --card: 0 0% 100%;
+    --card-foreground: 220 20% 10%;
+
+    --popover: 0 0% 100%;
+    --popover-foreground: 220 20% 10%;
+
+    --primary: 215 100% 50%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 214 15% 93%;
+    --secondary-foreground: 220 20% 25%;
+
+    --muted: 214 15% 95%;
+    --muted-foreground: 215 10% 50%;
+
+    --accent: 214 15% 93%;
+    --accent-foreground: 220 20% 10%;
+
+    --destructive: 0 72% 51%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 72% 40%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 50%;
+    --warning-foreground: 0 0% 100%;
+
+    --border: 214 20% 90%;
+    --input: 214 20% 90%;
+    --ring: 215 100% 50%;
+
+    --radius: 0.5rem;
+
+    --sidebar-background: 220 20% 12%;
+    --sidebar-foreground: 210 15% 80%;
+    --sidebar-primary: 215 100% 50%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 220 18% 18%;
+    --sidebar-accent-foreground: 210 15% 90%;
+    --sidebar-border: 220 15% 20%;
+    --sidebar-ring: 215 100% 50%;
+
+    --status-online: 142 72% 40%;
+    --status-offline: 0 72% 51%;
+    --status-warning: 38 92% 50%;
+  }
+
+  .dark {
+    --background: 220 20% 8%;
+    --foreground: 210 15% 90%;
+
+    --card: 220 18% 12%;
+    --card-foreground: 210 15% 90%;
+
+    --popover: 220 18% 12%;
+    --popover-foreground: 210 15% 90%;
+
+    --primary: 215 100% 55%;
+    --primary-foreground: 0 0% 100%;
+
+    --secondary: 220 15% 18%;
+    --secondary-foreground: 210 15% 80%;
+
+    --muted: 220 15% 16%;
+    --muted-foreground: 215 10% 55%;
+
+    --accent: 220 15% 18%;
+    --accent-foreground: 210 15% 90%;
+
+    --destructive: 0 72% 45%;
+    --destructive-foreground: 0 0% 100%;
+
+    --success: 142 72% 45%;
+    --success-foreground: 0 0% 100%;
+
+    --warning: 38 92% 55%;
+    --warning-foreground: 0 0% 100%;
+
+    --border: 220 15% 20%;
+    --input: 220 15% 20%;
+    --ring: 215 100% 55%;
+
+    --sidebar-background: 220 22% 6%;
+    --sidebar-foreground: 210 15% 75%;
+    --sidebar-primary: 215 100% 55%;
+    --sidebar-primary-foreground: 0 0% 100%;
+    --sidebar-accent: 220 18% 12%;
+    --sidebar-accent-foreground: 210 15% 85%;
+    --sidebar-border: 220 15% 14%;
+    --sidebar-ring: 215 100% 55%;
+
+    --status-online: 142 72% 45%;
+    --status-offline: 0 72% 45%;
+    --status-warning: 38 92% 55%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', ui-sans-serif, system-ui, sans-serif;
+  }
+}
+
+@layer utilities {
+  .unifi-card {
+    @apply bg-card rounded-lg border border-border shadow-sm;
+  }
+
+  .unifi-card-header {
+    @apply px-5 py-4 border-b border-border;
+  }
+
+  .unifi-card-body {
+    @apply px-5 py-4;
+  }
+
+  .status-dot {
+    @apply w-2.5 h-2.5 rounded-full inline-block;
+  }
+
+  .status-dot-online {
+    background-color: hsl(var(--status-online));
+    box-shadow: 0 0 6px hsl(var(--status-online) / 0.5);
+  }
+
+  .status-dot-offline {
+    background-color: hsl(var(--status-offline));
+    box-shadow: 0 0 6px hsl(var(--status-offline) / 0.5);
+  }
+
+  .status-dot-warning {
+    background-color: hsl(var(--status-warning));
+    box-shadow: 0 0 6px hsl(var(--status-warning) / 0.5);
+  }
+
+  .unifi-input {
+    @apply w-full px-3 py-2 rounded-md border border-input bg-background text-foreground text-sm font-mono
+           placeholder:text-muted-foreground
+           focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent
+           transition-colors;
+  }
+}
