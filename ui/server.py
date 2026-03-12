@@ -520,7 +520,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             t.start()
             # Long-running commands (update, install) need more time.
             cmd = body.get("command", "")
-            wait = 130 if cmd in ("update", "install", "reinstall",
+            # nginx proxy_read_timeout is 120s — stay under it with buffer
+            wait = 110 if cmd in ("update", "install", "reinstall",
                                   "uninstall", "uninstall-all") else 10
             t.join(timeout=wait)
             self._json(200, result_holder if result_holder

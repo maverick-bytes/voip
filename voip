@@ -110,6 +110,10 @@ update_service() {
     cd /data
 
     curl -sL "${GITHUB_BASE}/archive/refs/heads/main.tar.gz" | tar -xz
+    if [ ! -d voip-main ]; then
+        echo "  Error: download failed — check network and try again" >&2
+        exit 1
+    fi
     mv voip-main voip-update-tmp
 
     # ── Daemon: only reinstall if binary actually changed ─────────────────────
