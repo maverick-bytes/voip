@@ -177,7 +177,7 @@ _update_ui_bundle() {
     release_url="https://api.github.com/repos/${GITHUB_REPO}/releases/latest"
     echo "Checking for UI bundle update..."
     local release_json
-    release_json=$(curl -sL "$release_url" 2>/dev/null)
+    release_json=$(curl -sL "$release_url" 2>/dev/null) || true
     tag=$(echo "$release_json" | grep '"tag_name"' | cut -d'"' -f4 | head -1)
     asset_url=$(echo "$release_json" \
         | grep '"browser_download_url"' \
