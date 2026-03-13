@@ -472,7 +472,7 @@ case "${1:-}" in
     install)      install_service ;;
     uninstall)    uninstall_service ;;
     update)       update_service ;;
-    install-ui)   install_ui ;;
+    install-ui)   shift; install_ui "$@" ;;
     uninstall-ui) uninstall_ui ;;
     *)
         echo "Usage: $0 {install|uninstall|update|install-ui|uninstall-ui}" >&2
