@@ -99,7 +99,7 @@ Type in your keyboard `i` to enter insert mode, make your changes and then save 
 | Mode | Description |
 |------|-------------|
 | `pbr` | **Default.** Creates a dedicated routing table and ip rules. Mirrors exactly how UniFiOS handles a second WAN. No changes to existing interfaces. |
-| `forward` | Routes IMS traffic through an existing interface (`VOIP_FORWARD_INTERFACE`). Use if you want to have a dedicated VLAN for IMS traffic. |
+| `forward` | Routes IMS traffic through one or more existing VLAN interfaces (`VOIP_FORWARD_INTERFACE`). Use if you want a dedicated VLAN (or VLANs) for IMS traffic. |
 
 **Configuration guide:**
 
