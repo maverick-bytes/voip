@@ -448,6 +448,25 @@ def api_command(body: dict):
     }
     if cmd not in allowed:
         return {"ok": False, "output": f"Unknown command: {cmd}"}
+
+    # Commands that restart voip-ui (this process) must be fire-and-forget —
+    # if we wait for them they kill us before we can return a response.
+    BACKGROUND_CMDS = {"update", "install-ui", "install-all"}
+    if cmd in BACKGROUND_CMDS:
+        subprocess.Popen(
+            allowed[cmd], shell=True,
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            start_new_session=True)
+        friendly = {
+            "update":     "Update started — the service will restart automatically.\n"
+                          "Check progress with: journalctl -u voip-ui -f",
+            "install-ui": "Web UI reinstall started — the service will restart automatically.\n"
+                          "Check progress with: journalctl -u voip-ui -f",
+            "install-all": "Reinstall started — the service will restart automatically.\n"
+                           "Check progress with: journalctl -u voip-ui -f",
+        }
+        return {"ok": True, "output": friendly.get(cmd, "Started.")}
+
     try:
         result = subprocess.run(
             allowed[cmd], shell=True, capture_output=True,
