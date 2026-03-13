@@ -165,7 +165,7 @@ update_service() {
     # voip-restore.service are refreshed even when nginx is already patched.
     # install-ui is idempotent — it skips steps already done.
     echo "  Refreshing boot hook and nginx config..."
-    cd /data/voip && ./voip install-ui --quiet
+    cd /data/voip && ./voip install-ui --quiet --no-restart
 
     echo "Update complete. voipd.conf preserved."
 }
@@ -204,8 +204,15 @@ _update_ui_bundle() {
 
 install_ui() {
     # --quiet: suppress the final "Web UI installed" banner (used by update_service)
-    local _quiet=false
-    [ "${1:-}" = "--quiet" ] && _quiet=true
+    # --no-restart: skip systemctl start + nginx reload (used by server.py API so the
+    #               service can return the full output before restarting itself)
+    local _quiet=false _no_restart=false
+    for _arg in "$@"; do
+        case "$_arg" in
+            --quiet)     _quiet=true ;;
+            --no-restart) _no_restart=true ;;
+        esac
+    done
 
     echo "Installing VoIP web UI..."
     mkdir -p "${UI_DIR}/dist"
@@ -257,13 +264,17 @@ WantedBy=multi-user.target"
 
     systemctl daemon-reload
     systemctl enable ${UI_SERVICE_NAME}
-    systemctl start  ${UI_SERVICE_NAME}
-    # Reload nginx with retries — at boot nginx may not be ready to accept
-    # signals immediately even after its systemd unit reports started.
-    _i=0
-    until nginx -s reload 2>/dev/null || [ $_i -ge 10 ]; do
-        sleep 2; _i=$((_i + 1))
-    done
+    # --no-restart: skip starting the service — caller will restart it after
+    # returning the command output to the browser (avoids self-kill mid-response).
+    if [ "${_no_restart:-false}" = "false" ]; then
+        systemctl start  ${UI_SERVICE_NAME}
+        # Reload nginx with retries — at boot nginx may not be ready to accept
+        # signals immediately even after its systemd unit reports started.
+        _i=0
+        until nginx -s reload 2>/dev/null || [ $_i -ge 10 ]; do
+            sleep 2; _i=$((_i + 1))
+        done
+    fi
 
     if [ "$_quiet" = "false" ]; then
         echo ""

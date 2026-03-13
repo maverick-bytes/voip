@@ -449,30 +449,26 @@ def api_command(body: dict):
     if cmd not in allowed:
         return {"ok": False, "output": f"Unknown command: {cmd}"}
 
-    # Commands that restart voip-ui (this process) must be fire-and-forget —
-    # if we wait for them they kill us before we can return a response.
-    BACKGROUND_CMDS = {"update", "install-ui", "install-all"}
-    if cmd in BACKGROUND_CMDS:
-        subprocess.Popen(
-            allowed[cmd], shell=True,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-            start_new_session=True)
-        friendly = {
-            "update":     "Update started — the service will restart automatically.\n"
-                          "Check progress with: journalctl -u voip-ui -f",
-            "install-ui": "Web UI reinstall started — the service will restart automatically.\n"
-                          "Check progress with: journalctl -u voip-ui -f",
-            "install-all": "Reinstall started — the service will restart automatically.\n"
-                           "Check progress with: journalctl -u voip-ui -f",
-        }
-        return {"ok": True, "output": friendly.get(cmd, "Started.")}
+    # Commands that previously restarted voip-ui mid-execution now use
+    # --no-restart so we can capture full output first, then schedule
+    # the restart to fire 1s after we return the response.
+    DEFERRED_RESTART_CMDS = {"update", "install-ui", "install-all"}
 
     try:
         result = subprocess.run(
             allowed[cmd], shell=True, capture_output=True,
             text=True, timeout=120)
-        return {"ok": result.returncode == 0,
-                "output": (result.stdout + result.stderr).strip()}
+        output = (result.stdout + result.stderr).strip()
+        if cmd in DEFERRED_RESTART_CMDS:
+            # Schedule voip-ui restart 1s after we return — gives the HTTP
+            # response time to reach the browser before this process is killed.
+            import threading
+            threading.Timer(1.0, lambda: subprocess.Popen(
+                "systemctl restart voip-ui && nginx -s reload",
+                shell=True, start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )).start()
+        return {"ok": result.returncode == 0, "output": output}
     except subprocess.TimeoutExpired:
         return {"ok": False, "output": "Command timed out after 120s"}
     except Exception as e:
