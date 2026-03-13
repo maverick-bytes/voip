@@ -404,9 +404,9 @@ def api_command(body: dict):
     cmd = body.get("command", "")
     allowed = {
         "install":
-            "cd /data/voip && ./voip install && ./voip install-ui",
+            "cd /data/voip && ./voip install",
         "reinstall":
-            "cd /data/voip && ./voip install && ./voip install-ui",
+            "cd /data/voip && ./voip install",
         "uninstall":
             "cd /data/voip && ./voip uninstall "
             "&& chmod +x uninstall.sh && ./uninstall.sh",
