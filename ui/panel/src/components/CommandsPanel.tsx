@@ -112,8 +112,8 @@ const commands = [
   {
     id: "install",
     label: "Install / Reinstall Service",
-    description: "Install voipd and enable it as a systemd service. Run this again after a firmware upgrade — systemd service files don't survive firmware updates.",
-    command: "cd /data/voip && ./voip install",
+    description: "Install voipd daemon and web UI. Run this after a firmware upgrade — systemd service files and nginx config don't survive firmware updates.",
+    command: "cd /data/voip && ./voip install && ./voip install-ui",
     icon: Download,
     variant: "install" as const,
   },
