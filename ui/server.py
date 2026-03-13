@@ -437,11 +437,11 @@ def api_command(body: dict):
     cmd = body.get("command", "")
     allowed = {
         "install-ui":
-            "rm -f /data/voip/ui/.ui-version && cd /data/voip && ./voip install-ui",
+            "rm -f /data/voip/ui/.ui-version && cd /data/voip && ./voip install-ui --no-restart",
         "install-daemon":
             "cd /data/voip && ./voip install",
         "install-all":
-            "cd /data/voip && ./voip install && ./voip install-ui",
+            "cd /data/voip && ./voip install && ./voip install-ui --no-restart",
         "reinstall-daemon":
             "cd /data/voip && ./voip install",
         "uninstall":
