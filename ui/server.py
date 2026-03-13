@@ -141,29 +141,44 @@ def api_logs(lines=150):
 # ── UniFi config reader (cached) ──────────────────────────────────────────────
 
 _udapi_cache = None
+_udapi_cache_mtime = None
 
 def _udapi():
     """
-    Load udapi-net-cfg.json (or its hashed variant) once and cache it.
+    Load udapi-net-cfg.json (or its hashed variant) and cache it.
     UniFi OS sometimes writes the file as udapi-net-cfg-<hash>.json.
     We load all matching files and merge them so nothing is missed.
+    Cache is invalidated automatically when the file changes on disk
+    so stale interface data after a UniFi network reconfiguration is
+    returned at most until the next config page load.
     """
-    global _udapi_cache
+    global _udapi_cache, _udapi_cache_mtime
+    import glob as _glob, os as _os
+    patterns = [
+        "/data/udapi-config/udapi-net-cfg*.json",
+        "/mnt/data/udapi-config/udapi-net-cfg*.json",
+    ]
+    latest_mtime = 0
+    for pattern in patterns:
+        for p in sorted(_glob.glob(pattern)):
+            try:
+                latest_mtime = max(latest_mtime, _os.path.getmtime(p))
+            except Exception:
+                pass
+    if _udapi_cache is not None and latest_mtime == _udapi_cache_mtime:
+        return _udapi_cache
     if _udapi_cache is None:
-        import glob as _glob
-        _udapi_cache = {}
-        patterns = [
-            "/data/udapi-config/udapi-net-cfg*.json",
-            "/mnt/data/udapi-config/udapi-net-cfg*.json",
-        ]
-        for pattern in patterns:
-            for p in sorted(_glob.glob(pattern)):
-                try:
-                    data = json.loads(Path(p).read_text())
-                    # Merge: later files override earlier ones for top-level keys
-                    _udapi_cache.update(data)
-                except Exception:
-                    pass
+        pass  # fall through to reload below
+    _udapi_cache = {}
+    for pattern in patterns:
+        for p in sorted(_glob.glob(pattern)):
+            try:
+                data = json.loads(Path(p).read_text())
+                # Merge: later files override earlier ones for top-level keys
+                _udapi_cache.update(data)
+            except Exception:
+                pass
+    _udapi_cache_mtime = latest_mtime
     return _udapi_cache
 
 
@@ -228,7 +243,7 @@ def _wan_ports_from_config():
 #   eth4@switch0    — WAN port 5 on the switch fabric (WAN1 by default)
 #   eth5            — SFP+1, may be enslaved to br0 if used as LAN uplink
 #   eth6            — SFP+2, WAN2 slot (no master when not bridged)
-#   eth4.12@eth4    — management VLAN sub-iface — excluded
+#   ethN.VID@ethN   — VLAN sub-interfaces (any device) — excluded
 #   br0, br10…      — one bridge per UniFi network
 #   bond0           — internal switch bond — excluded
 #
@@ -449,12 +464,20 @@ def api_command(body: dict):
 class Handler(http.server.BaseHTTPRequestHandler):
     def log_message(self, fmt, *args): pass
 
+    def _security_headers(self):
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("X-Frame-Options", "SAMEORIGIN")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+                         "style-src 'self' 'unsafe-inline'; img-src 'self' data:")
+
     def _json(self, code, data):
         body = json.dumps(data).encode()
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(body))
         self.send_header("Access-Control-Allow-Origin", "*")
+        self._security_headers()
         self.end_headers()
         self.wfile.write(body)
 
@@ -479,6 +502,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", mime)
         self.send_header("Content-Length", len(data))
+        self._security_headers()
         self.end_headers()
         self.wfile.write(data)
 
