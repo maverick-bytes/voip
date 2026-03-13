@@ -339,14 +339,16 @@ def api_interfaces():
     # Names resolved from udapi vpn/wireguard/servers: wgsrvN -> server id N.
     vpn = []
     wg_names = _vpn_names()
+    seen_vpn = set()
     for line in sh("ip -o link show type wireguard 2>/dev/null; "
                    "ip -o link show 2>/dev/null | grep -E ' wg[a-z0-9]'").splitlines():
         m = re.match(r'^\d+:\s+(\S+?)(@\S+)?:\s+<([^>]*)>', line)
         if not m:
             continue
         name = m.group(1)
-        if not re.match(r'^wg', name):
+        if not re.match(r'^wg', name) or name in seen_vpn:
             continue
+        seen_vpn.add(name)
         has_carrier = "LOWER_UP" in (m.group(3) or "")
         vpn.append({
             "name": name,
