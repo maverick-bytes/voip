@@ -148,10 +148,10 @@ const ReinstallDialog = ({ onConfirm, onCancel }: ReinstallDialogProps) => (
           <p className="text-xs text-muted-foreground mt-1">Reinstalls voipd and re-enables its systemd service. Use if voipd stopped working after a firmware upgrade.</p>
         </button>
         <button onClick={() => onConfirm("all")}
-          className="w-full text-left p-4 rounded-lg border border-border hover:border-primary/50 hover:bg-primary/5 transition-colors group">
+          className="w-full text-left p-4 rounded-lg border border-blue-500/30 hover:border-blue-500 hover:bg-blue-500/5 transition-colors group">
           <div className="flex items-center justify-between">
-            <span className="text-sm font-medium text-card-foreground">Everything</span>
-            <span className="text-xs text-muted-foreground group-hover:text-primary transition-colors font-mono">install + install-ui</span>
+            <span className="text-sm font-semibold text-blue-400">Everything</span>
+            <span className="text-xs text-muted-foreground group-hover:text-blue-400 transition-colors font-mono">install + install-ui</span>
           </div>
           <p className="text-xs text-muted-foreground mt-1">Reinstalls both voipd and the web UI in one go.</p>
         </button>
