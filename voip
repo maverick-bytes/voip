@@ -139,7 +139,7 @@ update_service() {
         echo "  voipd unchanged — skipping reinstall."
     fi
 
-    # --- server.py: only restart voip-ui if it changed ----------------------────
+    # --- server.py: only restart voip-ui if it changed ----------------------
     local _server_changed=false
     if [ -f voip-update-tmp/ui/server.py ] && \
        ! cmp -s voip-update-tmp/ui/server.py /data/voip/ui/server.py 2>/dev/null; then
