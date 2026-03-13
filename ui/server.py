@@ -32,7 +32,7 @@ CONF_KEYS = [
     "VOIP_WAN_INTERFACE", "VOIP_WAN_VLAN", "VOIP_WAN_VLAN_INTERFACE",
     "VOIP_WAN_VLAN_INTERFACE_EGRESS_QOS", "PCSCF_HOSTNAME", "ROUTING_MODE",
     "VOIP_RT_TABLE", "VOIP_RT_TABLE_NAME", "VOIP_FORWARD_INTERFACE",
-    "VOIP_FORWARD_GATEWAY", "VOIP_IMS_SUBNET", "VOIP_DEBUG",
+    "VOIP_FORWARD_GATEWAY", "VOIP_IMS_SUBNET", "VOIP_VPN_INTERFACES", "VOIP_DEBUG",
 ]
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -307,7 +307,25 @@ def api_interfaces():
 
     wan.sort(key=lambda x: int(re.search(r'\d+', x["name"]).group()))
     lan.sort(key=lambda x: int(re.search(r'\d+', x["name"]).group()))
-    return {"wanInterfaces": wan, "lanInterfaces": lan}
+
+    # WireGuard / VPN interfaces — detected by type or wg* name prefix
+    vpn = []
+    for line in sh("ip -o link show type wireguard 2>/dev/null || ip -o link show 2>/dev/null | grep -E 'wg[0-9]'").splitlines():
+        m = re.match(r'^\d+:\s+(\S+?)(@\S+)?:\s+<([^>]*)>', line)
+        if not m:
+            continue
+        name = m.group(1)
+        if not re.match(r'^wg', name):
+            continue
+        has_carrier = "LOWER_UP" in (m.group(3) or "")
+        vpn.append({
+            "name": name,
+            "type": "vpn",
+            "description": "WireGuard VPN",
+            "status": "up" if has_carrier else "down",
+        })
+
+    return {"wanInterfaces": wan, "lanInterfaces": lan, "vpnInterfaces": vpn}
 
 def _wan_desc(name, has_carrier, confirmed_wan=None):
     if not has_carrier:

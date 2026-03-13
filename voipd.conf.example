@@ -39,10 +39,18 @@ VOIP_RT_TABLE_NAME="voip"
 VOIP_FORWARD_INTERFACE=""
 VOIP_FORWARD_GATEWAY=""
 
-# ── IMS subnet override ───────────────────────────────────────────────────────
+# --- IMS subnet override -----------------------------------------------------
 # Leave empty for auto-detection from DHCP-assigned IP (recommended)
 # Override example: VOIP_IMS_SUBNET="10.0.0.0/8"
 VOIP_IMS_SUBNET=""
+
+# --- VPN support (optional) --------------------------------------------------
+# Space-separated WireGuard interface names to allow VoIP traffic from.
+# Enables SIP/RTP over Teleport or the built-in WireGuard VPN server.
+# Leave empty to disable — VPN clients will not have VoIP access by default.
+# Find your WireGuard interface with: ip link show type wireguard
+# Example: VOIP_VPN_INTERFACES="wg0"
+VOIP_VPN_INTERFACES=""
 
 # Set to "true" for verbose debug output in journalctl
 VOIP_DEBUG="false"

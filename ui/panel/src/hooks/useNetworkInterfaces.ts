@@ -2,7 +2,7 @@ import { useState, useEffect } from "react";
 
 export interface NetworkInterface {
   name: string;
-  type: "wan" | "lan" | "virtual";
+  type: "wan" | "lan" | "vpn" | "virtual";
   description: string;
   status: "up" | "down";
 }
@@ -10,6 +10,7 @@ export interface NetworkInterface {
 export function useNetworkInterfaces() {
   const [wanInterfaces, setWanInterfaces] = useState<NetworkInterface[]>([]);
   const [lanInterfaces, setLanInterfaces] = useState<NetworkInterface[]>([]);
+  const [vpnInterfaces, setVpnInterfaces] = useState<NetworkInterface[]>([]);
   const [loading, setLoading] = useState(true);
 
   useEffect(() => {
@@ -21,11 +22,12 @@ export function useNetworkInterfaces() {
         const data = await res.json();
         setWanInterfaces(data.wanInterfaces ?? []);
         setLanInterfaces(data.lanInterfaces ?? []);
+        setVpnInterfaces(data.vpnInterfaces ?? []);
       } catch (err) {
         console.error("Failed to fetch network interfaces:", err);
-        // Fallback to empty — UI shows "no interfaces detected"
         setWanInterfaces([]);
         setLanInterfaces([]);
+        setVpnInterfaces([]);
       } finally {
         setLoading(false);
       }
@@ -33,5 +35,5 @@ export function useNetworkInterfaces() {
     fetchInterfaces();
   }, []);
 
-  return { wanInterfaces, lanInterfaces, loading };
+  return { wanInterfaces, lanInterfaces, vpnInterfaces, loading };
 }

@@ -46,7 +46,7 @@ interface Config {
   VOIP_WAN_INTERFACE?: string; VOIP_WAN_VLAN?: string; VOIP_WAN_VLAN_INTERFACE?: string;
   VOIP_WAN_VLAN_INTERFACE_EGRESS_QOS?: string; PCSCF_HOSTNAME?: string; ROUTING_MODE?: string;
   VOIP_RT_TABLE?: string; VOIP_RT_TABLE_NAME?: string; VOIP_FORWARD_INTERFACE?: string;
-  VOIP_FORWARD_GATEWAY?: string; VOIP_IMS_SUBNET?: string; VOIP_DEBUG?: string;
+  VOIP_FORWARD_GATEWAY?: string; VOIP_IMS_SUBNET?: string; VOIP_VPN_INTERFACES?: string; VOIP_DEBUG?: string;
 }
 
 const cosOptions = [
@@ -57,13 +57,14 @@ const cosOptions = [
 ];
 
 const ConfigPanel = () => {
-  const { wanInterfaces, lanInterfaces, loading: ifaceLoading } = useNetworkInterfaces();
+  const { wanInterfaces, lanInterfaces, vpnInterfaces, loading: ifaceLoading } = useNetworkInterfaces();
   const [config, setConfig] = useState<Config | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [showConfirm, setShowConfirm] = useState(false);
   const [saveResult, setSaveResult] = useState<{ ok: boolean; msg: string } | null>(null);
   const [forwardInterfaces, setForwardInterfaces] = useState<string[]>([]);
+  const [vpnSelectedInterfaces, setVpnSelectedInterfaces] = useState<string[]>([]);
 
   useEffect(() => {
     fetch("/voip/api/config")
@@ -73,6 +74,11 @@ const ConfigPanel = () => {
         setForwardInterfaces(
           data.VOIP_FORWARD_INTERFACE
             ? data.VOIP_FORWARD_INTERFACE.split(" ").filter(Boolean)
+            : []
+        );
+        setVpnSelectedInterfaces(
+          data.VOIP_VPN_INTERFACES
+            ? data.VOIP_VPN_INTERFACES.split(" ").filter(Boolean)
             : []
         );
       })
@@ -87,6 +93,14 @@ const ConfigPanel = () => {
     setForwardInterfaces(prev => {
       const next = prev.includes(name) ? prev.filter(i => i !== name) : [...prev, name];
       setConfig(c => c ? { ...c, VOIP_FORWARD_INTERFACE: next.join(" ") } : c);
+      return next;
+    });
+  };
+
+  const toggleVpnInterface = (name: string) => {
+    setVpnSelectedInterfaces(prev => {
+      const next = prev.includes(name) ? prev.filter(i => i !== name) : [...prev, name];
+      setConfig(c => c ? { ...c, VOIP_VPN_INTERFACES: next.join(" ") } : c);
       return next;
     });
   };
@@ -298,6 +312,43 @@ const ConfigPanel = () => {
               <input type="text" value={config.VOIP_IMS_SUBNET ?? ""}
                 onChange={e => handleChange("VOIP_IMS_SUBNET", e.target.value)}
                 className="unifi-input" placeholder="Auto-detect" />
+            </FieldGroup>
+
+            {/* VPN Support */}
+            <FieldGroup label="VPN Support"
+              hint="Allow SIP/RTP over WireGuard VPN (Teleport or built-in VPN server). Opt-in — disabled by default.">
+              {ifaceLoading ? (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
+                  <Loader2 className="w-4 h-4 animate-spin" /> Detecting interfaces…
+                </div>
+              ) : vpnInterfaces.length === 0 ? (
+                <p className="text-sm text-muted-foreground py-2">No WireGuard interfaces detected</p>
+              ) : (
+                <div className="space-y-2 rounded-md border border-border p-3">
+                  {vpnInterfaces.map(iface => {
+                    const checked = vpnSelectedInterfaces.includes(iface.name);
+                    return (
+                      <label key={iface.name}
+                        className={`flex items-center gap-3 rounded-md px-3 py-2 cursor-pointer transition-colors ${
+                          checked ? "bg-accent/50" : "hover:bg-accent/30"
+                        }`}>
+                        <Checkbox checked={checked}
+                          onCheckedChange={() => toggleVpnInterface(iface.name)} />
+                        <span className={`inline-block w-2 h-2 rounded-full ${
+                          iface.status === "up" ? "bg-green-500" : "bg-muted-foreground/40"
+                        }`} />
+                        <span className="font-mono text-sm">{iface.name}</span>
+                        <span className="text-xs text-muted-foreground">{iface.description}</span>
+                      </label>
+                    );
+                  })}
+                  {vpnSelectedInterfaces.length > 0 && (
+                    <p className="text-xs text-muted-foreground pt-1 border-t border-border mt-1">
+                      Enabled: <span className="font-mono">{vpnSelectedInterfaces.join(" ")}</span>
+                    </p>
+                  )}
+                </div>
+              )}
             </FieldGroup>
           </div>
 
