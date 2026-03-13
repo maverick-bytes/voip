@@ -403,9 +403,13 @@ def api_rt_tables():
 def api_command(body: dict):
     cmd = body.get("command", "")
     allowed = {
-        "install":
+        "install-ui":
+            "cd /data/voip && ./voip install-ui",
+        "install-daemon":
             "cd /data/voip && ./voip install",
-        "reinstall":
+        "install-all":
+            "cd /data/voip && ./voip install && ./voip install-ui",
+        "reinstall-daemon":
             "cd /data/voip && ./voip install",
         "uninstall":
             "cd /data/voip && ./voip uninstall "
