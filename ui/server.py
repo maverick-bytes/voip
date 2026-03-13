@@ -236,7 +236,34 @@ def _wan_ports_from_config():
     wan.update(_pppoe_parents())
     return wan
 
-# ── API: interfaces ───────────────────────────────────────────────────────────
+def _vpn_names():
+    """
+    Build a map of WireGuard interface name -> UniFi VPN server name.
+    UniFi names VPN server interfaces wgsrvN where N is the server id.
+    e.g. wgsrv1 -> vpn/wireguard/servers[id=1].name -> "One-Click VPN"
+    Also handles wgcliN (VPN clients) and wgs2sN (site-to-site) interfaces.
+    """
+    names = {}
+    data = _udapi()
+    for server in data.get("vpn/wireguard/servers", []):
+        sid  = str(server.get("id", "")).strip()
+        name = server.get("name", "")
+        if sid and name:
+            names[f"wgsrv{sid}"] = name
+    for client in data.get("vpn/wireguard/clients", []):
+        cid  = str(client.get("id", "")).strip()
+        name = client.get("name", "")
+        if cid and name:
+            names[f"wgcli{cid}"] = name
+    for s2s in data.get("vpn/wireguard/site-to-sites", []):
+        sid  = str(s2s.get("id", "")).strip()
+        name = s2s.get("name", "")
+        if sid and name:
+            names[f"wgs2s{sid}"] = name
+    return names
+
+
+# --- API: interfaces ----------------------------------------------------------
 #
 # UCG-Fiber ip link topology:
 #   eth0-3@switch0  — LAN switch fabric ports (never WAN)
@@ -308,9 +335,12 @@ def api_interfaces():
     wan.sort(key=lambda x: int(re.search(r'\d+', x["name"]).group()))
     lan.sort(key=lambda x: int(re.search(r'\d+', x["name"]).group()))
 
-    # WireGuard / VPN interfaces — detected by type or wg* name prefix
+    # WireGuard / VPN interfaces — detected by type or wg* name prefix.
+    # Names resolved from udapi vpn/wireguard/servers: wgsrvN -> server id N.
     vpn = []
-    for line in sh("ip -o link show type wireguard 2>/dev/null || ip -o link show 2>/dev/null | grep -E 'wg[0-9]'").splitlines():
+    wg_names = _vpn_names()
+    for line in sh("ip -o link show type wireguard 2>/dev/null; "
+                   "ip -o link show 2>/dev/null | grep -E ' wg[a-z0-9]'").splitlines():
         m = re.match(r'^\d+:\s+(\S+?)(@\S+)?:\s+<([^>]*)>', line)
         if not m:
             continue
@@ -321,7 +351,7 @@ def api_interfaces():
         vpn.append({
             "name": name,
             "type": "vpn",
-            "description": "WireGuard VPN",
+            "description": wg_names.get(name, "WireGuard VPN"),
             "status": "up" if has_carrier else "down",
         })
 

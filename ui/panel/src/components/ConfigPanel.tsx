@@ -334,11 +334,12 @@ const ConfigPanel = () => {
                         }`}>
                         <Checkbox checked={checked}
                           onCheckedChange={() => toggleVpnInterface(iface.name)} />
-                        <span className={`inline-block w-2 h-2 rounded-full ${
+                        <span className={`inline-block w-2 h-2 rounded-full shrink-0 ${
                           iface.status === "up" ? "bg-green-500" : "bg-muted-foreground/40"
                         }`} />
-                        <span className="font-mono text-sm">{iface.name}</span>
-                        <span className="text-xs text-muted-foreground">{iface.description}</span>
+                        <span className="text-sm text-card-foreground">{iface.description}</span>
+                        <span className="text-xs text-muted-foreground font-mono">{iface.name}</span>
+                        <span className="text-xs text-muted-foreground/60">WireGuard VPN</span>
                       </label>
                     );
                   })}
