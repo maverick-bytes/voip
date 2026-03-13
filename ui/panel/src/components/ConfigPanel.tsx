@@ -247,8 +247,8 @@ const ConfigPanel = () => {
 
             {/* Forward Interfaces — only in forward mode */}
             {config.ROUTING_MODE === "forward" && (
-              <FieldGroup label="Forward Interface"
-                hint="Select the VLAN interface for VoIP traffic routing">
+              <FieldGroup label="Forward Interfaces"
+                hint="Select one or more VLAN interfaces for VoIP traffic routing">
                 {ifaceLoading ? (
                   <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
                     <Loader2 className="w-4 h-4 animate-spin" /> Detecting interfaces…
