@@ -247,14 +247,14 @@ const ConfigPanel = () => {
 
             {/* Forward Interfaces — only in forward mode */}
             {config.ROUTING_MODE === "forward" && (
-              <FieldGroup label="Forward Interfaces"
-                hint="Select LAN / virtual network interfaces for VoIP traffic routing">
+              <FieldGroup label="Forward Interface"
+                hint="Select the VLAN interface for VoIP traffic routing">
                 {ifaceLoading ? (
                   <div className="flex items-center gap-2 text-sm text-muted-foreground py-2">
                     <Loader2 className="w-4 h-4 animate-spin" /> Detecting interfaces…
                   </div>
                 ) : lanInterfaces.length === 0 ? (
-                  <p className="text-sm text-muted-foreground py-2">No LAN interfaces detected</p>
+                  <p className="text-sm text-muted-foreground py-2">No VLAN interfaces detected</p>
                 ) : (
                   <div className="space-y-2 rounded-md border border-border p-3">
                     {lanInterfaces.map(iface => {
