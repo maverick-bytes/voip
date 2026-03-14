@@ -35,6 +35,7 @@ VOIP_RT_TABLE_NAME="voip"
 VOIP_FORWARD_INTERFACE=""
 VOIP_FORWARD_GATEWAY=""
 VOIP_IMS_SUBNET=""
+VOIP_VPN_INTERFACES=""
 UBIOS_NAT_CHAIN="UBIOS_POSTROUTING_USER_HOOK"
 VOIP_STATE_DIR="/var/run/voipd"
 VOIP_DEBUG="false"
@@ -322,6 +323,18 @@ _routing_setup_pbr() {
         || iptables -I FORWARD 1 -i "$VOIP_WAN_VLAN_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
     echo "  FORWARD    : LAN bridges -> $VOIP_WAN_VLAN_INTERFACE allowed"
 
+    if [ -n "$VOIP_VPN_INTERFACES" ]; then
+        for _vpn in $VOIP_VPN_INTERFACES; do
+            ip link show "$_vpn" >/dev/null 2>&1 \
+                || { echo "  WARNING: VPN iface $_vpn not found, skipping"; continue; }
+            iptables -C FORWARD -i "$_vpn" -o "$VOIP_WAN_VLAN_INTERFACE" \
+                -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
+                || iptables -I FORWARD 1 -i "$_vpn" -o "$VOIP_WAN_VLAN_INTERFACE" \
+                    -d "$VOIP_DEST_SUBNET" -j ACCEPT
+        done
+        echo "  VPN        : $VOIP_VPN_INTERFACES -> $VOIP_WAN_VLAN_INTERFACE (dst $VOIP_DEST_SUBNET only)"
+    fi
+
     iptables -C UBIOS_LAN_IN_USER -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
         || iptables -I UBIOS_LAN_IN_USER 1 -d "$VOIP_DEST_SUBNET" -j ACCEPT
     echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET"
@@ -354,6 +367,12 @@ _routing_teardown_pbr() {
     iptables -D FORWARD -i "$VOIP_WAN_VLAN_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     _wan_subif_rp_fix remove
     iptables -D UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null || true
+    if [ -n "$VOIP_VPN_INTERFACES" ]; then
+        for _vpn in $VOIP_VPN_INTERFACES; do
+            iptables -D FORWARD -i "$_vpn" -o "$VOIP_WAN_VLAN_INTERFACE" \
+                -d "$subnet" -j ACCEPT 2>/dev/null || true
+        done
+    fi
     sed -i "/^$VOIP_RT_TABLE /d" /etc/iproute2/rt_tables 2>/dev/null || true
 }
 
@@ -403,6 +422,18 @@ _routing_setup_forward() {
         || iptables -I FORWARD 1 -i "$VOIP_FORWARD_INTERFACE" -m state --state RELATED,ESTABLISHED -j ACCEPT
     echo "  FORWARD    : LAN bridges -> $VOIP_FORWARD_INTERFACE allowed"
 
+    if [ -n "$VOIP_VPN_INTERFACES" ]; then
+        for _vpn in $VOIP_VPN_INTERFACES; do
+            ip link show "$_vpn" >/dev/null 2>&1 \
+                || { echo "  WARNING: VPN iface $_vpn not found, skipping"; continue; }
+            iptables -C FORWARD -i "$_vpn" -o "$VOIP_FORWARD_INTERFACE" \
+                -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
+                || iptables -I FORWARD 1 -i "$_vpn" -o "$VOIP_FORWARD_INTERFACE" \
+                    -d "$VOIP_DEST_SUBNET" -j ACCEPT
+        done
+        echo "  VPN        : $VOIP_VPN_INTERFACES -> $VOIP_FORWARD_INTERFACE (dst $VOIP_DEST_SUBNET only)"
+    fi
+
     iptables -C UBIOS_LAN_IN_USER -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
         || iptables -I UBIOS_LAN_IN_USER 1 -d "$VOIP_DEST_SUBNET" -j ACCEPT
     echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET"
@@ -423,6 +454,12 @@ _routing_teardown_forward() {
     done
     iptables -D FORWARD -i "$fwd_iface" -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true
     iptables -D UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null || true
+    if [ -n "$VOIP_VPN_INTERFACES" ]; then
+        for _vpn in $VOIP_VPN_INTERFACES; do
+            iptables -D FORWARD -i "$_vpn" -o "$fwd_iface" \
+                -d "$subnet" -j ACCEPT 2>/dev/null || true
+        done
+    fi
 }
 
 # ── Routing dispatcher ────────────────────────────────────────────────────────
@@ -542,6 +579,7 @@ _show_status() {
     echo "  Routing   : $mode_info"
     echo "  IMS subnet: $subnet"
     echo "  NAT       : MASQUERADE in $UBIOS_NAT_CHAIN"
+    [ -n "$VOIP_VPN_INTERFACES" ] && echo "  VPN       : $VOIP_VPN_INTERFACES (VoIP forwarding enabled)"
     echo "----------------------------------------------------------"
     if [ -z "$PCSCF_HOSTNAME" ]; then
         echo "  SIP Proxy : PCSCF_HOSTNAME not set"
@@ -628,6 +666,18 @@ _rules_ensure() {
     || { iptables -I FORWARD 1 -i "$iface" -m state --state RELATED,ESTABLISHED -j ACCEPT
          echo "  [watchdog] restored FORWARD $iface -> LAN (RELATED,ESTABLISHED)"; }
     _wan_subif_rp_fix add
+
+    if [ -n "$VOIP_VPN_INTERFACES" ]; then
+        local _vpn
+        for _vpn in $VOIP_VPN_INTERFACES; do
+            ip link show "$_vpn" >/dev/null 2>&1 || continue
+            iptables -C FORWARD -i "$_vpn" -o "$iface" \
+                -d "$subnet" -j ACCEPT 2>/dev/null \
+            || { iptables -I FORWARD 1 -i "$_vpn" -o "$iface" \
+                     -d "$subnet" -j ACCEPT
+                 echo "  [watchdog] restored FORWARD $_vpn -> $iface dst $subnet (VPN)"; }
+        done
+    fi
 
     iptables -C UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null \
     || { iptables -I UBIOS_LAN_IN_USER 1 -d "$subnet" -j ACCEPT
