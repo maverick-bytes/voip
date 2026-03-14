@@ -480,11 +480,11 @@ def api_command(body: dict):
             "cd /data/voip && ./voip uninstall "
             "&& chmod +x uninstall.sh && ./uninstall.sh",
         "uninstall-ui":
-            "cd /data/voip && ./voip uninstall-ui",
+            "cd /data/voip && ./voip uninstall-ui --no-stop",
         "uninstall-all":
             "cd /data/voip && ./voip uninstall "
             "&& chmod +x uninstall.sh && ./uninstall.sh "
-            "&& ./voip uninstall-ui && rm -rf /data/voip",
+            "&& ./voip uninstall-ui --no-stop && rm -rf /data/voip",
         "update":
             "cd /data/voip && ./voip update",
         "verify":
@@ -499,10 +499,11 @@ def api_command(body: dict):
     if cmd not in allowed:
         return {"ok": False, "output": f"Unknown command: {cmd}"}
 
-    # Commands that previously restarted voip-ui mid-execution now use
-    # --no-restart so we can capture full output first, then schedule
-    # the restart to fire 1s after we return the response.
+    # Commands that restart or stop voip-ui mid-execution use deferred actions:
+    # - DEFERRED_RESTART_CMDS: run with --no-restart, then restart + nginx reload 1s later
+    # - DEFERRED_STOP_CMDS: run with --no-stop, then stop voip-ui 1s later
     DEFERRED_RESTART_CMDS = {"update", "install-ui", "install-all"}
+    DEFERRED_STOP_CMDS    = {"uninstall-ui", "uninstall-all"}
 
     try:
         result = subprocess.run(
@@ -510,11 +511,16 @@ def api_command(body: dict):
             text=True, timeout=120)
         output = (result.stdout + result.stderr).strip()
         if cmd in DEFERRED_RESTART_CMDS:
-            # Schedule voip-ui restart 1s after we return — gives the HTTP
-            # response time to reach the browser before this process is killed.
             import threading
             threading.Timer(1.0, lambda: subprocess.Popen(
                 "systemctl restart voip-ui && nginx -s reload",
+                shell=True, start_new_session=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )).start()
+        elif cmd in DEFERRED_STOP_CMDS:
+            import threading
+            threading.Timer(1.0, lambda: subprocess.Popen(
+                "systemctl stop voip-ui",
                 shell=True, start_new_session=True,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )).start()

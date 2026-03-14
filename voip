@@ -288,8 +288,15 @@ WantedBy=multi-user.target"
 # --- Uninstall web UI --------------------------------------------------------
 
 uninstall_ui() {
+    # --no-stop: skip systemctl stop voip-ui so the caller (server.py API) can
+    #            return the full output before this process is killed.
+    local _no_stop=false
+    [ "${1:-}" = "--no-stop" ] && _no_stop=true
+
     echo "Uninstalling VoIP web UI..."
-    systemctl stop    ${UI_SERVICE_NAME} 2>/dev/null || true
+    if [ "$_no_stop" = "false" ]; then
+        systemctl stop    ${UI_SERVICE_NAME} 2>/dev/null || true
+    fi
     systemctl disable ${UI_SERVICE_NAME} 2>/dev/null || true
     rm -f /lib/systemd/system/${UI_SERVICE_FILE}
     rm -f /etc/systemd/system/${UI_SERVICE_FILE}
@@ -473,7 +480,7 @@ case "${1:-}" in
     uninstall)    uninstall_service ;;
     update)       update_service ;;
     install-ui)   shift; install_ui "$@" ;;
-    uninstall-ui) uninstall_ui ;;
+    uninstall-ui) shift; uninstall_ui "$@" ;;
     *)
         echo "Usage: $0 {install|uninstall|update|install-ui|uninstall-ui}" >&2
         exit 1
