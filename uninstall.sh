@@ -72,7 +72,12 @@ while iptables -t mangle -D PREROUTING \
     -d "$_ims_subnet" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null; do :; done
 while iptables -t mangle -D PREROUTING \
     -d "$_ims_subnet" -j CONNMARK --save-mark --nfmask 0x7e0000 2>/dev/null; do :; done
+while iptables -t mangle -D PREROUTING \
+    -m connmark --mark 0x1e0000/0x7e0000 \
+    -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null; do :; done
 echo "  mangle MARK/CONNMARK removed"
+# Remove stale raw FORWARD rules that may exist from older installs.
+# Current installs use UBIOS_LAN_IN_USER instead, but clean these up for safety.
 for br in $(ip link show type bridge 2>/dev/null \
         | awk -F': ' '/^[0-9]/{print $2}' | awk '{print $1}'); do
     while iptables -D FORWARD -i "$br" -o "$VOIP_WAN_VLAN_INTERFACE" \
@@ -87,7 +92,7 @@ for sub in $(ip link show 2>/dev/null \
     while iptables -D FORWARD -i "$sub" \
         -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null; do :; done
 done
-echo "  FORWARD rules removed"
+echo "  FORWARD rules removed (legacy cleanup)"
 while iptables -D UBIOS_LAN_IN_USER \
     -d "$_ims_subnet" -j ACCEPT 2>/dev/null; do :; done
 echo "  UBIOS_LAN_IN_USER rule removed"
