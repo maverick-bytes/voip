@@ -323,8 +323,9 @@ _routing_setup_pbr() {
     iptables -C UBIOS_LAN_IN_USER -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
         || iptables -I UBIOS_LAN_IN_USER 1 -d "$VOIP_DEST_SUBNET" -j ACCEPT
     echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET"
-    [ -n "$VOIP_VPN_INTERFACES" ] && \
+    if [ -n "$VOIP_VPN_INTERFACES" ]; then
         echo "  VPN        : $VOIP_VPN_INTERFACES allowed via UBIOS_VPN_WAN_USER (zone firewall applies)"
+    fi
 }
 
 _routing_teardown_pbr() {
@@ -393,8 +394,9 @@ _routing_setup_forward() {
     iptables -C UBIOS_LAN_IN_USER -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
         || iptables -I UBIOS_LAN_IN_USER 1 -d "$VOIP_DEST_SUBNET" -j ACCEPT
     echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET"
-    [ -n "$VOIP_VPN_INTERFACES" ] && \
+    if [ -n "$VOIP_VPN_INTERFACES" ]; then
         echo "  VPN        : $VOIP_VPN_INTERFACES allowed via UBIOS_VPN_WAN_USER (zone firewall applies)"
+    fi
 }
 
 _routing_teardown_forward() {
