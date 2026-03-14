@@ -234,7 +234,7 @@ _wan_subif_rp_set() {
         cur=$(cat "/proc/sys/net/ipv4/conf/${sub}/rp_filter" 2>/dev/null)
         [ "$cur" = "0" ] && continue
         echo 0 > "/proc/sys/net/ipv4/conf/${sub}/rp_filter" 2>/dev/null || true
-        echo "  rp_filter  : disabled on $sub"
+        echo "  rp_filter  : set to 0 on $sub"
     done
 }
 
@@ -702,7 +702,7 @@ case $1 in
                     _sub=$(echo "$_evt" | awk -F'[ :@]' '{for(i=1;i<=NF;i++) if($i~/^[a-z]/ && $i!~/state/) {print $i; exit}}')
                     if [ -n "$_sub" ] && [ "$_sub" != "$VOIP_WAN_VLAN_INTERFACE" ]; then
                         echo 0 > "/proc/sys/net/ipv4/conf/${_sub}/rp_filter" 2>/dev/null || true
-                        echo "[ip-monitor] rp_filter=0 on $_sub (WAN subif UP after toggle)"
+                        echo "[ip-monitor] rp_filter set to 0 on $_sub (WAN subif UP after toggle)"
                     fi
                 fi
 
