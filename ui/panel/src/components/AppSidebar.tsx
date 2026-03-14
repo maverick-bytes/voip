@@ -57,7 +57,7 @@ const AppSidebar = ({ activeTab, onTabChange }: AppSidebarProps) => {
           <Heart className="w-4 h-4" />
           Donate
         </a>
-        <p className="text-[10px] text-sidebar-foreground">v1.1.0 • GPL-2.0</p>
+        <p className="text-[10px] text-sidebar-foreground">v1.2.0 • GPL-2.0</p>
       </div>
     </aside>
   );
