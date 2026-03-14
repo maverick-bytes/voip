@@ -226,11 +226,13 @@ _get_lan_bridges() {
 # rp_filter blocks return traffic from the voip VLAN if left at default (1).
 
 _wan_subif_rp_set() {
-    local sub
+    local sub cur
     for sub in $(ip link show 2>/dev/null \
             | awk -F'[ :@]' "/@${VOIP_WAN_INTERFACE}[: ]/{print \$3}" \
             | grep -v "^${VOIP_WAN_VLAN_INTERFACE}$"); do
         [ -z "$sub" ] && continue
+        cur=$(cat "/proc/sys/net/ipv4/conf/${sub}/rp_filter" 2>/dev/null)
+        [ "$cur" = "0" ] && continue
         echo 0 > "/proc/sys/net/ipv4/conf/${sub}/rp_filter" 2>/dev/null || true
         echo "  rp_filter  : disabled on $sub"
     done
@@ -609,7 +611,9 @@ _rules_ensure() {
     #   - mangle MARK/CONNMARK (PBR only)
     # Raw FORWARD rules are NOT maintained — LAN and VPN traffic is allowed via
     # UniFi's own UBIOS_LAN_IN_USER and UBIOS_VPN_WAN_USER chains respectively.
-    _wan_subif_rp_set
+    # NOTE: _wan_subif_rp_set is NOT called here — rp_filter is a kernel proc
+    # setting that only resets on interface recreation, which is already handled
+    # by ip-monitor events (link UP, address change, WAN recovery).
 
     iptables -C UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null \
     || { iptables -I UBIOS_LAN_IN_USER 1 -d "$subnet" -j ACCEPT
