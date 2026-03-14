@@ -89,6 +89,14 @@ VOIP_FORWARD_GATEWAY=""
 # Override example: VOIP_IMS_SUBNET="10.0.0.0/8"
 VOIP_IMS_SUBNET=""
 
+# ── VPN support (optional) ────────────────────────────────────────────────────
+# Space-separated WireGuard interface names to allow VoIP traffic from.
+# Enables SIP/RTP over Teleport or the built-in WireGuard VPN server.
+# Leave empty to disable (default) — VPN clients will not have VoIP access.
+# Find your WireGuard interface with: ip link show type wireguard
+# Example: VOIP_VPN_INTERFACES="wgsrv1"
+VOIP_VPN_INTERFACES=""
+
 # Set to "true" for verbose debug output in journalctl
 VOIP_DEBUG="false"
 ```
@@ -112,6 +120,13 @@ Type in your keyboard `i` to enter insert mode, make your changes and then save 
   - `br0` = default LAN bridge interface
   - `br102` = interface corresponding to VLAN 102
   - You can specify multiple interfaces separated by spaces: `"br0 br102"`
+
+* `VOIP_VPN_INTERFACES`: Space-separated list of WireGuard interface names to allow VoIP traffic from. Enables SIP/RTP over Teleport or the UniFi built-in WireGuard VPN server. **Disabled by default** — opt-in only.
+  - Find your WireGuard interface name with: `ip link show type wireguard`
+  - UniFi naming convention: `wgsrv1` (VPN Server), `wgcli1` (VPN Client), `wgs2s1` (Site-to-Site)
+  - Example: `VOIP_VPN_INTERFACES="wgsrv1"`
+  - Multiple interfaces: `VOIP_VPN_INTERFACES="wgsrv1 wgcli1"`
+  - Can also be configured from the web UI under **Config → VPN Support**
 
 ### IMS subnet detection
 
@@ -278,6 +293,22 @@ lsmod | grep sip
 # Expected: no output
 ```
 
+### SIP does not work over VPN (Teleport / WireGuard)
+
+By default VPN clients cannot reach the VoIP network. You need to opt in by setting `VOIP_VPN_INTERFACES` to your WireGuard interface name.
+
+Find the interface name:
+```sh
+ip link show type wireguard
+```
+
+Then either set it in `voipd.conf`:
+```sh
+VOIP_VPN_INTERFACES="wgsrv1"
+```
+
+Or enable it from the web UI under **Config → VPN Support**, tick the VPN interface, and save. The service will restart automatically and VPN clients will be able to register and make calls.
+
 ---
 
 ## FAQ
@@ -290,6 +321,9 @@ A: Currently, this script only configures IPv4. IPv6 support can be added if nee
 
 **Q: Will this survive a reboot?**  
 A: Yes, the systemd service is enabled to start automatically on boot.
+
+**Q: Can I use VoIP over VPN (Teleport / WireGuard)?**  
+A: Yes. Set `VOIP_VPN_INTERFACES` to your WireGuard interface name (e.g. `"wgsrv1"`) in `voipd.conf`, or enable it from the web UI under **Config → VPN Support**. It is disabled by default — VPN clients have no access to the VoIP network unless explicitly opted in. The feature works with both PBR and Forward routing modes.
 
 ## Want to help out and buy me a coffee ?
 
