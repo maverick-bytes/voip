@@ -13,8 +13,8 @@
 #                     register to it with a local SIP account instead of
 #                     registering to the ISP directly.  RTP still flows
 #                     peer-to-peer — no media is relayed, no extra latency.
-#                     Uses the same PBR table as pbr mode so the B2BUA
-#                     process's upstream SIP exits via the voip interface.
+#                     Uses the same voip routing table (203) as pbr mode so
+#                     the B2BUA process's upstream SIP exits via the voip interface.
 #                     Requires VOIP_B2BUA_USER / PASS / DOMAIN to be set.
 #
 #   pbr     (default) Policy-Based Routing.
@@ -430,9 +430,9 @@ _routing_teardown_forward() {
 }
 
 # ── B2BUA routing mode ────────────────────────────────────────────────────────
-# Signaling-only SIP B2BUA (b2bua.py).  Sets up the same PBR table (203/voip)
-# as pbr mode so IMS-bound traffic — including the B2BUA process's upstream
-# SIP, which sources from VOIP_IP — always exits via the voip interface.
+# Signaling-only SIP B2BUA (b2bua.py).  Sets up the voip routing table (203)
+# so IMS-bound traffic — including the B2BUA process's upstream SIP, which
+# sources from VOIP_IP — always exits via the voip interface.
 # rp_filter=0 on WAN subinterfaces is required: the ISP sends INVITE responses
 # via a different VLAN subinterface (e.g. eth4.12) than the registration VLAN.
 # The Python process is started after routing is established; RTP flows
@@ -482,13 +482,13 @@ _routing_setup_b2bua() {
     gw=$(_get_gateway_for_iface "$VOIP_WAN_VLAN_INTERFACE")
     [ -z "$gw" ] && echo "ERROR: cannot determine gateway" && return 1
 
-    echo "  Mode       : b2bua (signaling-only SIP proxy + PBR)"
+    echo "  Mode       : b2bua (signaling-only SIP proxy)"
     echo "  Gateway    : $gw"
     echo "$gw" > "$VOIP_STATE_DIR/gw"
 
-    # Same PBR table setup as pbr mode — the ip rule 'from $VOIP_IP lookup 203'
-    # ensures the B2BUA process's upstream SIP (sourced from VOIP_IP) exits via
-    # the voip interface.  MARK/CONNMARK handles LAN clients' RTP the same way.
+    # Uses the voip routing table (VOIP_RT_TABLE) — the ip rule 'from $VOIP_IP
+    # lookup $VOIP_RT_TABLE' ensures upstream SIP sourced from VOIP_IP exits
+    # via the voip interface.  MARK/CONNMARK handles LAN clients' RTP the same way.
     grep -q "^$VOIP_RT_TABLE " /etc/iproute2/rt_tables 2>/dev/null \
         || echo "$VOIP_RT_TABLE $VOIP_RT_TABLE_NAME" >> /etc/iproute2/rt_tables
 
@@ -767,9 +767,9 @@ _rules_ensure() {
     fi
 
     # Watchdog only maintains what we actually set:
-    #   - NAT MASQUERADE (both modes)
+    #   - NAT MASQUERADE (all modes)
     #   - UBIOS_LAN_IN_USER dst $subnet (allows LAN→IMS through zone firewall)
-    #   - mangle MARK/CONNMARK (PBR only)
+    #   - mangle MARK/CONNMARK (pbr and b2bua modes)
     # Raw FORWARD rules are NOT maintained — LAN and VPN traffic is allowed via
     # UniFi's own UBIOS_LAN_IN_USER and UBIOS_VPN_WAN_USER chains respectively.
     # NOTE: _wan_subif_rp_set is NOT called here — rp_filter is a kernel proc
