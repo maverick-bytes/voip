@@ -47,6 +47,9 @@ interface Config {
   VOIP_WAN_VLAN_INTERFACE_EGRESS_QOS?: string; PCSCF_HOSTNAME?: string; ROUTING_MODE?: string;
   VOIP_RT_TABLE?: string; VOIP_RT_TABLE_NAME?: string; VOIP_FORWARD_INTERFACE?: string;
   VOIP_FORWARD_GATEWAY?: string; VOIP_IMS_SUBNET?: string; VOIP_VPN_INTERFACES?: string; VOIP_DEBUG?: string;
+  VOIP_B2BUA_USER?: string; VOIP_B2BUA_PASS?: string; VOIP_B2BUA_DOMAIN?: string;
+  VOIP_B2BUA_LISTEN_PORT?: string; VOIP_B2BUA_LOCAL_USER?: string; VOIP_B2BUA_LOCAL_PASS?: string;
+  VOIP_B2BUA_REG_EXPIRES?: string;
 }
 
 const cosOptions = [
@@ -244,9 +247,9 @@ const ConfigPanel = () => {
 
             {/* Routing Mode */}
             <FieldGroup label="Routing Mode"
-              hint="PBR creates a dedicated routing table; Forward routes via an existing interface">
-              <div className="flex gap-2">
-                {["pbr", "forward"].map(mode => (
+              hint="B2BUA: local SIP proxy — LAN clients register to the gateway. PBR: dedicated routing table. Forward: route via existing VLAN interface.">
+              <div className="flex gap-2 flex-wrap">
+                {["b2bua", "pbr", "forward"].map(mode => (
                   <button key={mode} onClick={() => handleChange("ROUTING_MODE", mode)}
                     className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
                       config.ROUTING_MODE === mode
@@ -258,6 +261,70 @@ const ConfigPanel = () => {
                 ))}
               </div>
             </FieldGroup>
+
+            {/* B2BUA config — only in b2bua mode */}
+            {config.ROUTING_MODE === "b2bua" && (
+              <FieldGroup label="B2BUA — Upstream ISP Account"
+                hint="ISP SIP credentials the B2BUA uses to register to the IMS network on behalf of all local clients">
+                <div className="space-y-3">
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium text-muted-foreground mb-1">SIP Username</label>
+                      <input type="text" value={config.VOIP_B2BUA_USER ?? ""}
+                        onChange={e => handleChange("VOIP_B2BUA_USER", e.target.value)}
+                        className="unifi-input" placeholder="e.g. 0612345678" />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-muted-foreground mb-1">SIP Password</label>
+                      <input type="password" value={config.VOIP_B2BUA_PASS ?? ""}
+                        onChange={e => handleChange("VOIP_B2BUA_PASS", e.target.value)}
+                        className="unifi-input" />
+                    </div>
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1">SIP Domain</label>
+                    <input type="text" value={config.VOIP_B2BUA_DOMAIN ?? ""}
+                      onChange={e => handleChange("VOIP_B2BUA_DOMAIN", e.target.value)}
+                      className="unifi-input" placeholder="e.g. voip.ims.example.com" />
+                  </div>
+                  <div className="grid grid-cols-2 gap-3">
+                    <div>
+                      <label className="block text-xs font-medium text-muted-foreground mb-1">Listen Port</label>
+                      <input type="text" value={config.VOIP_B2BUA_LISTEN_PORT ?? "5060"}
+                        onChange={e => handleChange("VOIP_B2BUA_LISTEN_PORT", e.target.value)}
+                        className="unifi-input w-28" />
+                    </div>
+                    <div>
+                      <label className="block text-xs font-medium text-muted-foreground mb-1">Reg. Expires (s)</label>
+                      <input type="text" value={config.VOIP_B2BUA_REG_EXPIRES ?? "600"}
+                        onChange={e => handleChange("VOIP_B2BUA_REG_EXPIRES", e.target.value)}
+                        className="unifi-input w-28" />
+                    </div>
+                  </div>
+                </div>
+              </FieldGroup>
+            )}
+
+            {/* B2BUA local account — only in b2bua mode */}
+            {config.ROUTING_MODE === "b2bua" && (
+              <FieldGroup label="B2BUA — Local SIP Account"
+                hint="Credentials LAN clients use to register to the gateway (leave blank to allow any client without authentication)">
+                <div className="grid grid-cols-2 gap-3">
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1">Local Username</label>
+                    <input type="text" value={config.VOIP_B2BUA_LOCAL_USER ?? ""}
+                      onChange={e => handleChange("VOIP_B2BUA_LOCAL_USER", e.target.value)}
+                      className="unifi-input" placeholder="Optional" />
+                  </div>
+                  <div>
+                    <label className="block text-xs font-medium text-muted-foreground mb-1">Local Password</label>
+                    <input type="password" value={config.VOIP_B2BUA_LOCAL_PASS ?? ""}
+                      onChange={e => handleChange("VOIP_B2BUA_LOCAL_PASS", e.target.value)}
+                      className="unifi-input" placeholder="Optional" />
+                  </div>
+                </div>
+              </FieldGroup>
+            )}
 
             {/* Forward Interfaces — only in forward mode */}
             {config.ROUTING_MODE === "forward" && (
@@ -298,13 +365,15 @@ const ConfigPanel = () => {
               </FieldGroup>
             )}
 
-            {/* Routing Table */}
-            <FieldGroup label="PBR Routing Table Number"
-              hint="Auto-detected at install. Only change if you have a table conflict.">
-              <input type="text" value={config.VOIP_RT_TABLE ?? ""}
-                onChange={e => handleChange("VOIP_RT_TABLE", e.target.value)}
-                className="unifi-input w-32" />
-            </FieldGroup>
+            {/* Routing Table — shown for pbr and b2bua (both use table 203) */}
+            {(config.ROUTING_MODE === "pbr" || config.ROUTING_MODE === "b2bua") && (
+              <FieldGroup label="Voip Routing Table Number"
+                hint="Auto-detected at install. Only change if you have a table conflict.">
+                <input type="text" value={config.VOIP_RT_TABLE ?? ""}
+                  onChange={e => handleChange("VOIP_RT_TABLE", e.target.value)}
+                  className="unifi-input w-32" />
+              </FieldGroup>
+            )}
 
             {/* IMS Subnet Override */}
             <FieldGroup label="IMS Subnet Override"

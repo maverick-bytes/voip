@@ -33,6 +33,9 @@ CONF_KEYS = [
     "VOIP_WAN_VLAN_INTERFACE_EGRESS_QOS", "PCSCF_HOSTNAME", "ROUTING_MODE",
     "VOIP_RT_TABLE", "VOIP_RT_TABLE_NAME", "VOIP_FORWARD_INTERFACE",
     "VOIP_FORWARD_GATEWAY", "VOIP_IMS_SUBNET", "VOIP_VPN_INTERFACES", "VOIP_DEBUG",
+    "VOIP_B2BUA_USER", "VOIP_B2BUA_PASS", "VOIP_B2BUA_DOMAIN",
+    "VOIP_B2BUA_LISTEN_PORT", "VOIP_B2BUA_LOCAL_USER", "VOIP_B2BUA_LOCAL_PASS",
+    "VOIP_B2BUA_REG_EXPIRES",
 ]
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -100,6 +103,28 @@ def api_status():
         except Exception:
             uptime = uptime_raw
     conf = read_conf()
+    routing_mode = conf.get("ROUTING_MODE", "pbr")
+
+    # In B2BUA mode the SIP endpoint for clients is the gateway itself,
+    # not the upstream P-CSCF — the B2BUA terminates SIP locally.
+    sip_proxy = read_state("pcscf_ip")
+    b2bua_registered = None
+    b2bua_clients = None
+    b2bua_listen_port = conf.get("VOIP_B2BUA_LISTEN_PORT", "5060")
+    if routing_mode == "b2bua":
+        b2bua_status_file = STATE_DIR / "b2bua_status"
+        if b2bua_status_file.exists():
+            for line in b2bua_status_file.read_text().splitlines():
+                if line.startswith("upstream_registered="):
+                    b2bua_registered = line.split("=", 1)[1].strip()
+                elif line.startswith("local_clients="):
+                    b2bua_clients = line.split("=", 1)[1].strip() or None
+        # Gateway IP (br0) is the SIP address LAN clients should register to
+        gw_ip = sh("ip -o -4 addr show dev br0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1")
+        if not gw_ip:
+            gw_ip = sh("ip -o -4 addr show scope global 2>/dev/null | awk '!/lo/{print $4}' | cut -d/ -f1 | head -1")
+        sip_proxy = f"{gw_ip}:{b2bua_listen_port}" if gw_ip else f":{b2bua_listen_port}"
+
     return {
         "serviceRunning": running,
         "interface":    read_state("voip_ip") and conf.get(
@@ -108,12 +133,15 @@ def api_status():
         "wanInterface": conf.get("VOIP_WAN_INTERFACE", ""),
         "voipIp":       read_state("voip_ip"),
         "gateway":      read_state("gw"),
-        "routingMode":  conf.get("ROUTING_MODE", "pbr").upper(),
+        "routingMode":  routing_mode.upper(),
         "routingTable": conf.get("VOIP_RT_TABLE", ""),
         "imsSubnet":    read_state("subnet"),
         "natRule":      "MASQUERADE in UBIOS_POSTROUTING_USER_HOOK",
-        "sipProxy":     read_state("pcscf_ip"),
+        "sipProxy":     sip_proxy,
         "uptime":       uptime,
+        "b2buaRegistered": b2bua_registered,
+        "b2buaClients":    b2bua_clients,
+        "b2buaListenPort": b2bua_listen_port,
     }
 
 # ── API: logs ─────────────────────────────────────────────────────────────────

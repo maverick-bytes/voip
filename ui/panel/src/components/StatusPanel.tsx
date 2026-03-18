@@ -6,6 +6,7 @@ interface StatusData {
   serviceRunning: boolean; interface: string; vlan: string; wanInterface: string;
   voipIp: string; gateway: string; routingMode: string; routingTable: string;
   imsSubnet: string; natRule: string; sipProxy: string; uptime: string;
+  b2buaRegistered?: string | null; b2buaClients?: string | null; b2buaListenPort?: string;
 }
 
 const StatusPanel = () => {
@@ -127,21 +128,52 @@ const StatusPanel = () => {
         <InfoCard icon={<Shield className="w-4 h-4" />} label="NAT"        value={s.natRule} small />
       </div>
 
-      {/* SIP Proxy */}
+      {/* SIP Proxy / B2BUA endpoint */}
       <div className="unifi-card border-primary/30 bg-primary/5">
         <div className="unifi-card-body flex items-center gap-3">
           <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center">
             <Phone className="w-5 h-5 text-primary" />
           </div>
           <div>
-            <p className="text-xs text-muted-foreground font-medium uppercase tracking-wide">SIP Proxy</p>
-            <p className="text-lg font-mono font-semibold text-card-foreground">
-              {s.sipProxy && s.sipProxy !== "(unresolved)" ? s.sipProxy : "Not resolved yet"}
-            </p>
-            <p className="text-xs text-muted-foreground">Use this address in your SIP client / ATA</p>
+            {s.routingMode === "B2BUA" ? (
+              <>
+                <p className="text-xs text-muted-foreground font-medium uppercase tracking-wide">SIP Registrar (B2BUA)</p>
+                <p className="text-lg font-mono font-semibold text-card-foreground">
+                  {s.sipProxy || "Resolving…"}
+                </p>
+                <p className="text-xs text-muted-foreground">Register your SIP client to this gateway address</p>
+              </>
+            ) : (
+              <>
+                <p className="text-xs text-muted-foreground font-medium uppercase tracking-wide">SIP Proxy</p>
+                <p className="text-lg font-mono font-semibold text-card-foreground">
+                  {s.sipProxy && s.sipProxy !== "(unresolved)" ? s.sipProxy : "Not resolved yet"}
+                </p>
+                <p className="text-xs text-muted-foreground">Use this address in your SIP client / ATA</p>
+              </>
+            )}
           </div>
         </div>
       </div>
+
+      {/* B2BUA upstream status — only shown in b2bua mode */}
+      {s.routingMode === "B2BUA" && (
+        <div className="unifi-card">
+          <div className="unifi-card-header">
+            <h3 className="text-sm font-semibold text-card-foreground">B2BUA Status</h3>
+          </div>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4 unifi-card-body">
+            <InfoCard icon={<Shield className="w-4 h-4" />} label="Upstream Registration"
+              value={
+                s.b2buaRegistered === "True"  ? "✓ Registered" :
+                s.b2buaRegistered === "False" ? "✗ Not registered" :
+                "Starting…"
+              } />
+            <InfoCard icon={<Phone className="w-4 h-4" />} label="Local Clients"
+              value={s.b2buaClients || "None registered"} />
+          </div>
+        </div>
+      )}
     </div>
   );
 };
