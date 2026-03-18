@@ -6,7 +6,16 @@
 # the Free Software Foundation; either version 2 of the License, or
 # (at your option) any later version.
 #
-# Two routing modes available — see ROUTING_MODE below:
+# Three routing modes available — see ROUTING_MODE below:
+#
+#   b2bua             Signaling-only Back-to-Back User Agent.
+#                     A Python SIP proxy runs on the router; LAN clients
+#                     register to it with a local SIP account instead of
+#                     registering to the ISP directly.  RTP still flows
+#                     peer-to-peer — no media is relayed, no extra latency.
+#                     Uses the same PBR table as pbr mode so the B2BUA
+#                     process's upstream SIP exits via the voip interface.
+#                     Requires VOIP_B2BUA_USER / PASS / DOMAIN to be set.
 #
 #   pbr     (default) Policy-Based Routing.
 #                     Creates a dedicated routing table
@@ -39,6 +48,14 @@ VOIP_VPN_INTERFACES=""
 UBIOS_NAT_CHAIN="UBIOS_POSTROUTING_USER_HOOK"
 VOIP_STATE_DIR="/var/run/voipd"
 VOIP_DEBUG="false"
+# B2BUA mode settings (only used when ROUTING_MODE=b2bua)
+VOIP_B2BUA_USER=""
+VOIP_B2BUA_PASS=""
+VOIP_B2BUA_DOMAIN=""
+VOIP_B2BUA_LISTEN_PORT="5060"
+VOIP_B2BUA_LOCAL_USER=""
+VOIP_B2BUA_LOCAL_PASS=""
+VOIP_B2BUA_REG_EXPIRES="600"
 
 # Source user configuration — overrides defaults above
 [ -f /data/voip/voipd.conf ] && . /data/voip/voipd.conf
@@ -412,6 +429,135 @@ _routing_teardown_forward() {
     iptables -D UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null || true
 }
 
+# ── B2BUA routing mode ────────────────────────────────────────────────────────
+# Signaling-only SIP B2BUA (b2bua.py).  Sets up the same PBR table (203/voip)
+# as pbr mode so IMS-bound traffic — including the B2BUA process's upstream
+# SIP, which sources from VOIP_IP — always exits via the voip interface.
+# rp_filter=0 on WAN subinterfaces is required: the ISP sends INVITE responses
+# via a different VLAN subinterface (e.g. eth4.12) than the registration VLAN.
+# The Python process is started after routing is established; RTP flows
+# peer-to-peer with no relay so no additional forwarding rules are needed.
+
+_b2bua_start() {
+    if [ -z "$VOIP_B2BUA_USER" ] || [ -z "$VOIP_B2BUA_PASS" ] || [ -z "$VOIP_B2BUA_DOMAIN" ]; then
+        echo "  B2BUA  : ERROR — VOIP_B2BUA_USER, VOIP_B2BUA_PASS and VOIP_B2BUA_DOMAIN must be set"
+        return 1
+    fi
+    if [ ! -f /data/voip/b2bua.py ]; then
+        echo "  B2BUA  : ERROR — /data/voip/b2bua.py not found"
+        return 1
+    fi
+    local pcscf_ip
+    pcscf_ip=$(cat "$VOIP_STATE_DIR/pcscf_ip" 2>/dev/null | grep -v unresolved || echo "")
+    [ -z "$pcscf_ip" ] && pcscf_ip="$PCSCF_HOSTNAME"
+    echo "  B2BUA  : starting (${VOIP_B2BUA_USER}@${VOIP_B2BUA_DOMAIN} via ${pcscf_ip})"
+    B2BUA_PROXY="$pcscf_ip"           \
+    B2BUA_DOMAIN="$VOIP_B2BUA_DOMAIN" \
+    B2BUA_USER="$VOIP_B2BUA_USER"     \
+    B2BUA_PASS="$VOIP_B2BUA_PASS"     \
+    B2BUA_VOIP_IP="$VOIP_IP"          \
+    B2BUA_LOCAL_PORT="$VOIP_B2BUA_LISTEN_PORT" \
+    B2BUA_LOCAL_USER="$VOIP_B2BUA_LOCAL_USER"  \
+    B2BUA_LOCAL_PASS="$VOIP_B2BUA_LOCAL_PASS"  \
+    B2BUA_REG_EXPIRES="$VOIP_B2BUA_REG_EXPIRES" \
+    B2BUA_STATE_DIR="$VOIP_STATE_DIR" \
+    B2BUA_DEBUG="$VOIP_DEBUG"         \
+    python3 /data/voip/b2bua.py >> "$VOIP_STATE_DIR/b2bua.log" 2>&1 &
+    echo $! > "$VOIP_STATE_DIR/b2bua_pid"
+    echo "  B2BUA  : PID $(cat $VOIP_STATE_DIR/b2bua_pid)"
+}
+
+_b2bua_stop() {
+    if [ -f "$VOIP_STATE_DIR/b2bua_pid" ]; then
+        local pid
+        pid=$(cat "$VOIP_STATE_DIR/b2bua_pid")
+        kill "$pid" 2>/dev/null || true
+        rm -f "$VOIP_STATE_DIR/b2bua_pid" "$VOIP_STATE_DIR/b2bua_status"
+        echo "  B2BUA  : stopped (PID $pid)"
+    fi
+}
+
+_routing_setup_b2bua() {
+    local gw
+    gw=$(_get_gateway_for_iface "$VOIP_WAN_VLAN_INTERFACE")
+    [ -z "$gw" ] && echo "ERROR: cannot determine gateway" && return 1
+
+    echo "  Mode       : b2bua (signaling-only SIP proxy + PBR)"
+    echo "  Gateway    : $gw"
+    echo "$gw" > "$VOIP_STATE_DIR/gw"
+
+    # Same PBR table setup as pbr mode — the ip rule 'from $VOIP_IP lookup 203'
+    # ensures the B2BUA process's upstream SIP (sourced from VOIP_IP) exits via
+    # the voip interface.  MARK/CONNMARK handles LAN clients' RTP the same way.
+    grep -q "^$VOIP_RT_TABLE " /etc/iproute2/rt_tables 2>/dev/null \
+        || echo "$VOIP_RT_TABLE $VOIP_RT_TABLE_NAME" >> /etc/iproute2/rt_tables
+
+    ip rule del to   "$VOIP_DEST_SUBNET" priority 100 2>/dev/null || true
+    ip rule del from "$VOIP_IP"          priority 100 2>/dev/null || true
+    ip route flush table "$VOIP_RT_TABLE" 2>/dev/null || true
+    while iptables -t mangle -D PREROUTING \
+        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING \
+        -d "$VOIP_DEST_SUBNET" -j CONNMARK --save-mark --nfmask 0x7e0000 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING \
+        -m connmark --mark 0x1e0000/0x7e0000 \
+        -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null; do :; done
+
+    ip route add default via "$gw" dev "$VOIP_WAN_VLAN_INTERFACE" table "$VOIP_RT_TABLE"
+    echo "  Table $VOIP_RT_TABLE    : default via $gw dev $VOIP_WAN_VLAN_INTERFACE"
+
+    ip rule add to   "$VOIP_DEST_SUBNET" lookup "$VOIP_RT_TABLE" priority 100
+    ip rule add from "$VOIP_IP"          lookup "$VOIP_RT_TABLE" priority 100
+    echo "  Rules      : to $VOIP_DEST_SUBNET and from $VOIP_IP -> table $VOIP_RT_TABLE (priority 100)"
+
+    iptables -t mangle -I PREROUTING 1 \
+        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark 0x1e0000/0x7e0000
+    iptables -t mangle -I PREROUTING 2 \
+        -d "$VOIP_DEST_SUBNET" -j CONNMARK --save-mark --nfmask 0x7e0000
+    iptables -t mangle -I PREROUTING 3 \
+        -m connmark --mark 0x1e0000/0x7e0000 \
+        -j CONNMARK --restore-mark --nfmask 0x7e0000
+    echo "  Mangle     : PREROUTING dst $VOIP_DEST_SUBNET -> MARK + CONNMARK save/restore"
+
+    iptables -t nat -C "$UBIOS_NAT_CHAIN" \
+        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A "$UBIOS_NAT_CHAIN" \
+        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE
+    echo "  NAT        : MASQUERADE in $UBIOS_NAT_CHAIN on $VOIP_WAN_VLAN_INTERFACE"
+
+    _wan_subif_rp_set
+
+    iptables -C UBIOS_LAN_IN_USER -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
+        || iptables -I UBIOS_LAN_IN_USER 1 -d "$VOIP_DEST_SUBNET" -j ACCEPT
+    echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET"
+}
+
+_routing_teardown_b2bua() {
+    local subnet voip_ip
+    subnet=$(cat  "$VOIP_STATE_DIR/subnet"  2>/dev/null || echo "10.0.0.0/8")
+    voip_ip=$(cat "$VOIP_STATE_DIR/voip_ip" 2>/dev/null || echo "")
+
+    _b2bua_stop
+
+    ip rule del to "$subnet" priority 100              2>/dev/null || true
+    [ -n "$voip_ip" ] && \
+        ip rule del from "$voip_ip" priority 100       2>/dev/null || true
+    ip route flush table "$VOIP_RT_TABLE"               2>/dev/null || true
+
+    iptables -t mangle -D PREROUTING \
+        -d "$subnet" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null || true
+    iptables -t mangle -D PREROUTING \
+        -d "$subnet" -j CONNMARK --save-mark --nfmask 0x7e0000 2>/dev/null || true
+    iptables -t mangle -D PREROUTING \
+        -m connmark --mark 0x1e0000/0x7e0000 \
+        -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null || true
+    iptables -t nat -D "$UBIOS_NAT_CHAIN" \
+        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE 2>/dev/null || true
+
+    iptables -D UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null || true
+    sed -i "/^$VOIP_RT_TABLE /d" /etc/iproute2/rt_tables 2>/dev/null || true
+}
+
 # ── Routing dispatcher ────────────────────────────────────────────────────────
 
 _routing_setup() {
@@ -424,6 +570,7 @@ _routing_setup() {
     case "$ROUTING_MODE" in
         pbr)     _routing_setup_pbr     || return 1 ;;
         forward) _routing_setup_forward || return 1 ;;
+        b2bua)   _routing_setup_b2bua   || return 1 ;;
         *) echo "ERROR: unknown ROUTING_MODE '$ROUTING_MODE'"; return 1 ;;
     esac
     if [ "$fresh" = "true" ]; then
@@ -441,6 +588,7 @@ _routing_teardown() {
     case "$ROUTING_MODE" in
         pbr)     _routing_teardown_pbr     ;;
         forward) _routing_teardown_forward ;;
+        b2bua)   _routing_teardown_b2bua   ;;
     esac
     ip route flush cache 2>/dev/null || true
 }
@@ -516,6 +664,12 @@ _show_status() {
     case "$ROUTING_MODE" in
         pbr)     mode_info="PBR -> table $VOIP_RT_TABLE ($VOIP_RT_TABLE_NAME)" ;;
         forward) mode_info="Forward via $(cat $VOIP_STATE_DIR/forward_iface 2>/dev/null || echo $VOIP_FORWARD_INTERFACE)" ;;
+        b2bua)
+            local b2bua_reg b2bua_clients
+            b2bua_reg=$(grep "^upstream_registered=" "$VOIP_STATE_DIR/b2bua_status" 2>/dev/null | cut -d= -f2)
+            b2bua_clients=$(grep "^local_clients=" "$VOIP_STATE_DIR/b2bua_status" 2>/dev/null | cut -d= -f2)
+            mode_info="B2BUA | upstream: ${b2bua_reg:-starting} | clients: ${b2bua_clients:-(none)}"
+            ;;
         *)       mode_info="$ROUTING_MODE" ;;
     esac
 
@@ -536,7 +690,14 @@ _show_status() {
     elif [ "$pcscf_ip" = "(unresolved)" ]; then
         echo "  SIP Proxy : NOT RESOLVED -- check DNS via $VOIP_WAN_VLAN_INTERFACE"
     else
-        echo "  SIP Proxy : $pcscf_ip  <-- use this in your SIP client / ATA"
+        if [ "$ROUTING_MODE" = "b2bua" ]; then
+            echo "  SIP Proxy : $pcscf_ip  (upstream, used by B2BUA)"
+            _gw_ip=$(ip -o -4 addr show dev br0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+            _gw_ip="${_gw_ip:-$(ip -o -4 addr show scope global 2>/dev/null | awk '!/lo/{print $4}' | cut -d/ -f1 | head -1)}"
+            echo "  SIP Client: register to ${_gw_ip}:${VOIP_B2BUA_LISTEN_PORT} (local B2BUA)"
+        else
+            echo "  SIP Proxy : $pcscf_ip  <-- use this in your SIP client / ATA"
+        fi
     fi
     echo "=========================================================="
     echo ""
@@ -593,7 +754,7 @@ _rules_ensure() {
     if ! mkdir "$_lock" 2>/dev/null; then return 0; fi
     trap 'rm -rf "$_lock"' EXIT INT TERM
 
-    if [ "$mode" = "pbr" ]; then
+    if [ "$mode" = "pbr" ] || [ "$mode" = "b2bua" ]; then
         iptables -t nat -C "$UBIOS_NAT_CHAIN" \
             -o "$iface" -j MASQUERADE 2>/dev/null \
         || { iptables -t nat -A "$UBIOS_NAT_CHAIN" -o "$iface" -j MASQUERADE
@@ -619,7 +780,7 @@ _rules_ensure() {
     || { iptables -I UBIOS_LAN_IN_USER 1 -d "$subnet" -j ACCEPT
          echo "  [watchdog] restored UBIOS_LAN_IN_USER ACCEPT dst $subnet"; }
 
-    if [ "$mode" = "pbr" ]; then
+    if [ "$mode" = "pbr" ] || [ "$mode" = "b2bua" ]; then
         iptables -t mangle -C PREROUTING \
             -d "$subnet" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null \
         || { iptables -t mangle -I PREROUTING 1 \
@@ -637,6 +798,14 @@ _rules_ensure() {
                  -m connmark --mark 0x1e0000/0x7e0000 \
                  -j CONNMARK --restore-mark --nfmask 0x7e0000
              echo "  [watchdog] restored mangle CONNMARK restore for $subnet"; }
+        if [ "$mode" = "b2bua" ] && [ -f "$VOIP_STATE_DIR/b2bua_pid" ]; then
+            local _bpid
+            _bpid=$(cat "$VOIP_STATE_DIR/b2bua_pid")
+            if ! kill -0 "$_bpid" 2>/dev/null; then
+                echo "  [watchdog] B2BUA process died, restarting..."
+                _b2bua_start
+            fi
+        fi
     fi
 
     rm -rf "$_lock"
@@ -652,6 +821,9 @@ case $1 in
         mkdir -p "$VOIP_STATE_DIR"
         _network_setup || { echo "FATAL: network setup failed"; exit 1; }
         _resolve_pcscf
+        if [ "$ROUTING_MODE" = "b2bua" ]; then
+            _b2bua_start || echo "WARNING: B2BUA failed to start — check config"
+        fi
         _show_status
         echo "VoIP service started (mode: $ROUTING_MODE)"
 
@@ -683,6 +855,10 @@ case $1 in
                             conntrack -D --orig-dst "${VOIP_IMS_SUBNET:-10.0.0.0/8}" 2>/dev/null || true
                             conntrack -D --reply-dst "${VOIP_IMS_SUBNET:-10.0.0.0/8}" 2>/dev/null || true
                             _network_setup || { echo "[ip-monitor] ERROR: setup failed"; continue; }
+                            if [ "$ROUTING_MODE" = "b2bua" ]; then
+                                _resolve_pcscf
+                                _b2bua_start
+                            fi
                             sleep 3
                             _rules_ensure \
                                 "$VOIP_WAN_VLAN_INTERFACE" \
@@ -715,6 +891,9 @@ case $1 in
                         _routing_setup "false" \
                             && echo "[ip-monitor] routing restored (table $VOIP_RT_TABLE OK)" \
                             || echo "[ip-monitor] ERROR: routing restore failed"
+                        if [ "$ROUTING_MODE" = "b2bua" ]; then
+                            _b2bua_stop; _b2bua_start
+                        fi
                         sleep 3
                     else
                         echo "[ip-monitor] voip address event — re-ensuring rules"
@@ -733,10 +912,9 @@ case $1 in
         while true; do
             sleep 5
             _rules_ensure \
-                "$([ "$ROUTING_MODE" = "pbr" ] \
-                    && echo "$VOIP_WAN_VLAN_INTERFACE" \
-                    || cat "$VOIP_STATE_DIR/forward_iface" 2>/dev/null \
-                    || echo "$VOIP_FORWARD_INTERFACE")" \
+                "$([ "$ROUTING_MODE" = "forward" ] \
+                    && { cat "$VOIP_STATE_DIR/forward_iface" 2>/dev/null || echo "$VOIP_FORWARD_INTERFACE"; } \
+                    || echo "$VOIP_WAN_VLAN_INTERFACE")" \
                 "$(cat "$VOIP_STATE_DIR/subnet" 2>/dev/null \
                     || echo "${VOIP_IMS_SUBNET:-10.0.0.0/8}")" \
                 "$ROUTING_MODE"
@@ -750,7 +928,8 @@ case $1 in
         _network_teardown
         rm -f "$VOIP_STATE_DIR/subnet"  "$VOIP_STATE_DIR/voip_ip" \
               "$VOIP_STATE_DIR/gw"      "$VOIP_STATE_DIR/pcscf_ip" \
-              "$VOIP_STATE_DIR/forward_iface" "$VOIP_STATE_DIR/link_state"
+              "$VOIP_STATE_DIR/forward_iface" "$VOIP_STATE_DIR/link_state" \
+              "$VOIP_STATE_DIR/b2bua_pid" "$VOIP_STATE_DIR/b2bua_status"
         echo "VoIP service stopped"
         ;;
     status)
