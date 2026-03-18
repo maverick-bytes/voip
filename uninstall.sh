@@ -43,13 +43,19 @@ echo ""
 echo "[1/7] Stopping voipd service..."
 systemctl stop voipd 2>/dev/null || true
 systemctl disable voipd 2>/dev/null || true
+# Also stop B2BUA process if running independently
+if [ -f "$VOIP_STATE_DIR/b2bua_pid" ]; then
+    kill "$(cat $VOIP_STATE_DIR/b2bua_pid)" 2>/dev/null || true
+    rm -f "$VOIP_STATE_DIR/b2bua_pid" "$VOIP_STATE_DIR/b2bua_status"
+fi
 
 echo "[2/7] Removing systemd service..."
 rm -f "$VOIPD_SERVICE_LIB" "$VOIPD_SERVICE_ETC"
 systemctl daemon-reload 2>/dev/null || true
 
-echo "[3/7] Removing voipd binary..."
+echo "[3/7] Removing voipd binary and B2BUA script..."
 rm -f "$VOIPD_BIN"
+rm -f /data/voip/b2bua.py
 
 echo "[4/7] Removing DHCP network config..."
 rm -f "$VOIPD_NETWORK"
@@ -103,7 +109,7 @@ _voip_ip=$(cat "$VOIP_STATE_DIR/voip_ip" 2>/dev/null || true)
 [ -n "$_voip_ip" ] && ip rule del from "$_voip_ip" priority 100 2>/dev/null || true
 ip route flush table "$VOIP_RT_TABLE" 2>/dev/null || true
 sed -i "/^$VOIP_RT_TABLE /d" /etc/iproute2/rt_tables 2>/dev/null || true
-echo "  PBR table $VOIP_RT_TABLE removed"
+echo "  Voip routing table $VOIP_RT_TABLE removed"
 conntrack -D --orig-dst  "$_ims_subnet" 2>/dev/null || true
 conntrack -D --reply-dst "$_ims_subnet" 2>/dev/null || true
 ip route flush cache 2>/dev/null || true

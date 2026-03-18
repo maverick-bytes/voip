@@ -25,17 +25,31 @@ VOIP_WAN_VLAN_INTERFACE_EGRESS_QOS="0:5 1:5 2:5 3:5 4:5 5:5 6:5 7:5"
 # Leave as example value if your ISP does not use IMS/P-CSCF
 PCSCF_HOSTNAME="p-cscf.example.com"
 
-# Routing mode: "pbr" (default, recommended) or "forward"
-ROUTING_MODE="pbr"
+# Routing mode: "b2bua" (default, recommended), "pbr" or "forward"
+ROUTING_MODE="b2bua"
 
-# ── PBR mode ─────────────────────────────────────────────────────────────────
-# Routing table number — auto-detected at install to avoid conflicts with
-# UniFiOS WAN tables (201, 202...). Do NOT change unless you know what
-# you are doing.
+# --- B2BUA mode (only used when ROUTING_MODE="b2bua") -------------------------
+# ISP SIP credentials the B2BUA registers to the IMS network upstream.
+# LAN clients register to the gateway instead of the ISP directly.
+# RTP still flows peer-to-peer — no media is relayed by the gateway.
+VOIP_B2BUA_USER=""
+VOIP_B2BUA_PASS=""
+VOIP_B2BUA_DOMAIN=""
+# Local SIP port (UDP + TCP) — default 5060
+VOIP_B2BUA_LISTEN_PORT="5060"
+# Optional local account for clients (leave empty to allow any client without auth)
+VOIP_B2BUA_LOCAL_USER=""
+VOIP_B2BUA_LOCAL_PASS=""
+# REGISTER refresh interval in seconds
+VOIP_B2BUA_REG_EXPIRES="600"
+
+# --- Voip routing table (used by pbr and b2bua modes) ------------------------
+# Auto-detected at install to avoid conflicts with UniFiOS WAN tables
+# (201, 202...). Do NOT change unless you have a table conflict.
 VOIP_RT_TABLE="203"
 VOIP_RT_TABLE_NAME="voip"
 
-# ── Forward mode (only used when ROUTING_MODE="forward") ─────────────────────
+# --- Forward mode (only used when ROUTING_MODE="forward") --------------------
 VOIP_FORWARD_INTERFACE=""
 VOIP_FORWARD_GATEWAY=""
 
