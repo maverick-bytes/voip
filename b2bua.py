@@ -271,6 +271,7 @@ class _Dialog:
         self.lc_body=b''          # stored SDP body for outbound auth retry
         self.up_id=''; self.up_from=''; self.up_to=''
         self.up_to_tag=''; self.up_cseq=1; self.up_branch=''
+        self.up_routes=[]         # Route headers used in INVITE (required in ACK per RFC 3261)
         self.up_contact=None      # Contact URI from IMS 200 OK (for ACK routing)
         self.up_contact_addr=None # (ip, port) parsed from up_contact
         self.up_auth_tried=False  # prevent infinite auth retry loops
@@ -485,6 +486,7 @@ def _on_local_invite(msg,addr,transport='udp',conn=None):
     with _ureg_lock:
         for sr in _ureg.get('service_route',[]):
             up_hdrs.insert(0,('route',sr))
+        dlg.up_routes = [sr for sr in _ureg.get('service_route',[])]
         if _ureg.get('challenge'):
             h=_build_auth('INVITE',up_req_uri,SIP_USER,SIP_PASS,
                           _ureg['challenge'],'Proxy-Authorization')
@@ -538,6 +540,7 @@ def _on_upstream_invite_resp(msg,raw=b''):
                     with _ureg_lock:
                         for sr in _ureg.get('service_route',[]):
                             retry_hdrs.insert(0,('route',sr))
+                        dlg.up_routes = list(_ureg.get('service_route',[]))
                     if dlg.lc_body: retry_hdrs.append(('content-type','application/sdp'))
                     _send(_build(f'INVITE {_uri(dlg.up_to)} SIP/2.0', retry_hdrs, dlg.lc_body),
                           (PROXY_IP, PROXY_PORT))
@@ -596,6 +599,9 @@ def _on_local_ack(msg,addr,transport='udp',conn=None):
         ('from',dlg.up_from),('to',to_hdr),('call-id',dlg.up_id),
         ('cseq',f'{dlg.up_cseq} ACK'),('max-forwards','70'),
     ]
+    # RFC 3261 §13.2.2.4: ACK for 2xx MUST include same Route as the INVITE
+    for rt in getattr(dlg, 'up_routes', []):
+        hdrs.insert(1, ('route', rt))
     body=msg.get('body',b'')
     if body: hdrs.append(('content-type','application/sdp'))
     _send(_build(f'ACK {ack_target} SIP/2.0',hdrs,body), ack_dest_ip)
