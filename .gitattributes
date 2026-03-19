@@ -1,0 +1,9 @@
+# Force LF line endings for shell scripts — CRLF breaks #!/bin/sh on Linux
+voipd        text eol=lf
+voip         text eol=lf
+uninstall.sh text eol=lf
+b2bua.py     text eol=lf
+*.sh         text eol=lf
+*.py         text eol=lf
+*.conf       text eol=lf
+*.md         text eol=lf
