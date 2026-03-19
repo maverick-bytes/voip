@@ -123,11 +123,16 @@ update_service() {
     fi
     mv voip-main voip-update-tmp
 
-    # --- Daemon: only reinstall if binary actually changed -------------------
-    local _voipd_changed=false
+    # --- Daemon: only reinstall if voipd or b2bua.py actually changed --------
+    local _voipd_changed=false _b2bua_changed=false
     if ! cmp -s voip-update-tmp/voipd /usr/local/bin/voipd 2>/dev/null; then
         _voipd_changed=true
     fi
+    if [ -f voip-update-tmp/b2bua.py ] && \
+       ! cmp -s voip-update-tmp/b2bua.py /data/voip/b2bua.py 2>/dev/null; then
+        _b2bua_changed=true
+    fi
+
     cp voip-update-tmp/voipd         /data/voip/voipd
     cp voip-update-tmp/voip          /data/voip/voip
     cp voip-update-tmp/voipd.service /data/voip/voipd.service
@@ -139,12 +144,18 @@ update_service() {
         cp voip-update-tmp/voipd.conf.example /data/voip/voipd.conf.example
     chmod +x /data/voip/voipd /data/voip/voip /data/voip/uninstall.sh
 
-    if [ "$_voipd_changed" = "true" ]; then
+    if [ "$_voipd_changed" = "true" ] || [ "$_b2bua_changed" = "true" ]; then
         cp /data/voip/voipd /usr/local/bin/voipd
         cp /data/voip/voipd.service /lib/systemd/system/voipd.service
         systemctl daemon-reload
         systemctl restart voipd
-        echo "  voipd updated and restarted."
+        if [ "$_voipd_changed" = "true" ] && [ "$_b2bua_changed" = "true" ]; then
+            echo "  voipd and b2bua.py updated — service restarted."
+        elif [ "$_voipd_changed" = "true" ]; then
+            echo "  voipd updated — service restarted."
+        else
+            echo "  b2bua.py updated — service restarted."
+        fi
     else
         echo "  voipd unchanged — skipping reinstall."
     fi
