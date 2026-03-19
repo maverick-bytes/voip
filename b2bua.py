@@ -271,6 +271,8 @@ class _Dialog:
         self.lc_body=b''          # stored SDP body for outbound auth retry
         self.up_id=''; self.up_from=''; self.up_to=''
         self.up_to_tag=''; self.up_cseq=1; self.up_branch=''
+        self.up_contact=None      # Contact URI from IMS 200 OK (for ACK routing)
+        self.up_contact_addr=None # (ip, port) parsed from up_contact
         self.up_auth_tried=False  # prevent infinite auth retry loops
         self.state='trying'; self.lock=threading.Lock()
 
@@ -368,22 +370,25 @@ def _on_register_resp(msg,raw=b''):
             log.debug(f'REGISTER resp {st}')
 
 # ── Local registrar ────────────────────────────────────────────────────────────
-# AOR is keyed by username@source_ip so the domain in the From header is ignored.
-# This means sip:Brother@192.168.5.1 and sip:Brother@voip.ims.example.com from
-# the same device both map to the same registry slot, preventing duplicate entries
-# when a client is configured with the gateway IP vs the ISP domain as SIP domain.
+# AOR is keyed by username@source_ip:source_port so that:
+#   - Two devices at different IPs get separate slots
+#   - One device registering on both UDP and TCP gets separate slots (different port)
+#   - Domain in From header (192.168.5.1 vs voip.ims.example.com) is ignored
+# TCP ports change on reconnect; the old slot expires naturally within its TTL.
 
-def _aor(from_val, src_ip=''):
+def _aor(from_val, addr=None):
     user = _user_from_uri(_uri(from_val))
     if not user:
         user = re.sub(r'[;?].*', '', _uri(from_val))
-    return f'sip:{user}@{src_ip}' if src_ip else f'sip:{user}'
+    if addr:
+        return f'sip:{user}@{addr[0]}:{addr[1]}'
+    return f'sip:{user}'
 
 def _on_local_register(msg,addr,transport='udp',conn=None):
     from_val=_gh(msg,'from'); cont_val=_gh(msg,'contact')
     call_id=_gh(msg,'call-id')
-    # Key by username@source_ip — domain in From header is irrelevant for local auth
-    aor=_aor(from_val, addr[0])
+    # Key by username@source_ip:port — domain in From header is irrelevant
+    aor=_aor(from_val, addr)
     local_username=_user_from_uri(_uri(from_val)) or SIP_USER
 
     if LOCAL_PASS:
@@ -541,6 +546,20 @@ def _on_upstream_invite_resp(msg,raw=b''):
         # ── end auth retry ─────────────────────────────────────────────────────
 
         if st>=200 and not dlg.up_to_tag: dlg.up_to_tag=_tag(_gh(msg,'to'))
+        if st==200 and not dlg.up_contact:
+            # Store Contact from 200 OK for RFC-3261-compliant ACK routing
+            cont = _gh(msg, 'contact')
+            if cont:
+                dlg.up_contact = _uri(cont)
+                m = re.search(r'sips?:[^@]+@([^;>\s]+)', dlg.up_contact)
+                if m:
+                    hp = m.group(1).rstrip('>')
+                    if ':' in hp:
+                        h, p = hp.rsplit(':', 1)
+                        try: dlg.up_contact_addr = (h, int(p))
+                        except ValueError: pass
+                    else:
+                        dlg.up_contact_addr = (hp, 5060)
         if 180<=st<=199: dlg.state='ringing'
         elif st==200:    dlg.state='established'
         elif st>=400:    dlg.state='terminated'
@@ -568,7 +587,10 @@ def _on_local_ack(msg,addr,transport='udp',conn=None):
     if not dlg: return
     to_hdr=dlg.up_to
     if dlg.up_to_tag and 'tag=' not in to_hdr: to_hdr+=f';tag={dlg.up_to_tag}'
-    up_req_uri=_up_uri(_uri(to_hdr))
+    # RFC 3261 §13.2.2.4: ACK for 2xx MUST go to Contact URI from the 200 OK,
+    # not to the proxy. Use stored contact from 200 if available, else fall back.
+    ack_target = dlg.up_contact if getattr(dlg, 'up_contact', None) else _up_uri(_uri(to_hdr))
+    ack_dest_ip = dlg.up_contact_addr if getattr(dlg, 'up_contact_addr', None) else (PROXY_IP, PROXY_PORT)
     hdrs=[
         ('via',         f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()};rport'),
         ('from',dlg.up_from),('to',to_hdr),('call-id',dlg.up_id),
@@ -576,7 +598,7 @@ def _on_local_ack(msg,addr,transport='udp',conn=None):
     ]
     body=msg.get('body',b'')
     if body: hdrs.append(('content-type','application/sdp'))
-    _send(_build(f'ACK {up_req_uri} SIP/2.0',hdrs,body),(PROXY_IP,PROXY_PORT))
+    _send(_build(f'ACK {ack_target} SIP/2.0',hdrs,body), ack_dest_ip)
 
 def _on_local_bye(msg,addr,transport='udp',conn=None):
     call_id=_gh(msg,'call-id')
@@ -828,9 +850,16 @@ def _dispatch(data, addr, transport='udp', conn=None):
 def _write_state():
     os.makedirs(STATE_DIR,exist_ok=True)
     with _regs_lock:
-        # Show username@source_ip for each registered client
-        clients=[f'{r.username}@{r.addr[0]}' for r in _regs.values()
-                 if r.expires>time.time()]
+        # Deduplicate display by username@ip — a device registering on both
+        # UDP and TCP gets two slots in _regs but shows as one client.
+        seen = set()
+        clients = []
+        for r in _regs.values():
+            if r.expires > time.time():
+                key = f'{r.username}@{r.addr[0]}'
+                if key not in seen:
+                    seen.add(key)
+                    clients.append(key)
     try:
         with open(f'{STATE_DIR}/b2bua_status','w') as f:
             f.write(f'upstream_registered={_ureg.get("registered",False)}\n')
