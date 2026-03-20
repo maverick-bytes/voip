@@ -1126,6 +1126,14 @@ def main():
     _udp_sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
     try: _udp_sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)
     except (AttributeError,OSError): pass
+    # Mark all outgoing UDP packets with the voip fwmark so the kernel routes
+    # them via the voip routing table (ip rule fwmark 0x1e0000 lookup voip).
+    # This is required because the socket is bound to 0.0.0.0 — without an
+    # explicit source IP the kernel would otherwise route upstream SIP via the
+    # default WAN (ppp0) instead of the voip VLAN interface.
+    try: _udp_sock.setsockopt(socket.SOL_SOCKET,socket.SO_MARK,0x1e0000)
+    except (AttributeError,OSError) as e: import logging; logging.getLogger('voipd.b2bua').warning(f'SO_MARK unavailable: {e}')
+    except (AttributeError,OSError): pass
     _udp_sock.bind(('0.0.0.0',LOCAL_PORT))
 
     threading.Thread(target=_tcp_server_loop,daemon=True,name='tcp-srv').start()
