@@ -185,10 +185,14 @@ update_service() {
     # Always re-run install-ui --quiet on update so the boot hook and
     # voip-restore.service are refreshed even when nginx is already patched.
     # install-ui is idempotent — it skips steps already done.
-    echo "  Refreshing boot hook and nginx config..."
-    cd /data/voip && ./voip install-ui --quiet --no-restart
-
     echo "Update complete. voipd.conf preserved."
+    # Re-execute install-ui via 'sh /data/voip/voip' rather than './voip'.
+    # If this process was started from a CRLF copy of the script (old install),
+    # calling ./voip inline keeps running the CRLF shell in memory and the
+    # parser trips on 'esac\r', printing 's: not found'. Opening the file
+    # explicitly with 'sh' forces a fresh parse of the LF version from disk.
+    echo "  Refreshing boot hook and nginx config..."
+    sh /data/voip/voip install-ui --quiet --no-restart
 }
 
 # --- Download UI bundle from GitHub Releases ---------------------------------
