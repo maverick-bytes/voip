@@ -111,12 +111,78 @@ _dhcp_stop() {
     systemctl restart systemd-networkd
 }
 
+# ── P-CSCF DNS lookup helper ──────────────────────────────────────────────────
+# Resolves PCSCF_HOSTNAME using the DNS server from the VoIP DHCP lease.
+# Prints the resolved IP to stdout, or nothing on failure. No side effects,
+# no sleep — safe to call before routing rules are installed (the VoIP
+# interface is already up after _dhcp_start so its subnet route exists).
+
+_resolve_pcscf_ip() {
+    [ -z "$PCSCF_HOSTNAME" ] && return 0
+    local pcscf_ip dns_server iface_index
+    iface_index=$(ip link show "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null \
+        | awk -F': ' 'NR==1{print $1}')
+
+    # 1. DNS from systemd-networkd lease file for this interface
+    if [ -n "$iface_index" ] && [ -f "/run/systemd/netif/leases/$iface_index" ]; then
+        dns_server=$(grep "^DNS=" "/run/systemd/netif/leases/$iface_index" \
+            2>/dev/null | cut -d'=' -f2 | awk '{print $1}')
+    fi
+    # 2. Fallback: find lease by assigned IP address
+    if [ -z "$dns_server" ] && [ -n "$VOIP_IP" ]; then
+        local lf
+        lf=$(grep -rl "ADDRESS=$VOIP_IP" /run/systemd/netif/leases/ 2>/dev/null | head -1)
+        [ -n "$lf" ] && \
+            dns_server=$(grep "^DNS=" "$lf" 2>/dev/null | cut -d'=' -f2 | awk '{print $1}')
+    fi
+    # 3. Fallback: resolvectl
+    [ -z "$dns_server" ] && \
+        dns_server=$(resolvectl dns "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null \
+            | sed 's/.*: //' | tr ' ' '\n' \
+            | grep -E '^[0-9]{1,3}\.' | head -1)
+
+    _debug "DNS for P-CSCF lookup: ${dns_server:-(not found)}"
+
+    # nslookup → dig → getent
+    [ -n "$dns_server" ] && command -v nslookup >/dev/null 2>&1 && \
+        pcscf_ip=$(nslookup "$PCSCF_HOSTNAME" "$dns_server" 2>/dev/null \
+            | awk '/^Address:/{print $2}' | grep -Ev '#' \
+            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+
+    [ -z "$pcscf_ip" ] && [ -n "$dns_server" ] && command -v dig >/dev/null 2>&1 && \
+        pcscf_ip=$(dig @"$dns_server" +short +time=4 +tries=2 "$PCSCF_HOSTNAME" \
+            2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+
+    [ -z "$pcscf_ip" ] && command -v getent >/dev/null 2>&1 && \
+        pcscf_ip=$(getent hosts "$PCSCF_HOSTNAME" 2>/dev/null \
+            | awk '{print $1}' | head -1)
+
+    echo "$pcscf_ip"
+}
+
 # ── Subnet / IP detection ─────────────────────────────────────────────────────
-# Reads the IP assigned to the VoIP VLAN interface and derives the IMS subnet
-# to use for routing rules. Can be overridden via VOIP_IMS_SUBNET in voipd.conf.
+# Reads the IP assigned to the VoIP VLAN interface, then resolves the P-CSCF
+# proxy address (using the VoIP interface DNS) and derives the IMS subnet from
+# the P-CSCF IP. This is more accurate than using the VoIP IP: the P-CSCF is
+# the actual IMS entry point, so its subnet is the subnet we need to route.
+# Falls back to the VoIP IP octet method if P-CSCF cannot be resolved.
+# Can be fully overridden via VOIP_IMS_SUBNET in voipd.conf.
+
+_subnet_from_ip() {
+    # Print the summary RFC-1918 / CGNAT / private supernet for a given IP.
+    local ip="$1" o1
+    o1=$(echo "$ip" | cut -d'.' -f1)
+    case "$o1" in
+        10)  echo "10.0.0.0/8"      ;;
+        100) echo "100.64.0.0/10"   ;;
+        172) echo "172.16.0.0/12"   ;;
+        192) echo "192.168.0.0/16"  ;;
+        *)   echo "10.0.0.0/8"      ;;  # safe default
+    esac
+}
 
 _detect_voip_config() {
-    local voip_cidr voip_ip o1
+    local voip_cidr voip_ip
 
     voip_cidr=$(ip addr show "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null \
         | grep "inet " | awk '{print $2}' | head -1)
@@ -129,28 +195,38 @@ _detect_voip_config() {
 
     VOIP_IP="$voip_ip"
     VOIP_CIDR="$voip_cidr"
+    echo "  VoIP IP    : $voip_ip"
 
     if [ -n "$VOIP_IMS_SUBNET" ]; then
         VOIP_DEST_SUBNET="$VOIP_IMS_SUBNET"
         echo "  IMS subnet : $VOIP_DEST_SUBNET (manual override)"
     else
-        o1=$(echo "$voip_ip" | cut -d'.' -f1)
-        case "$o1" in
-            10)  VOIP_DEST_SUBNET="10.0.0.0/8"      ;;
-            100) VOIP_DEST_SUBNET="100.64.0.0/10"   ;;
-            172) VOIP_DEST_SUBNET="172.16.0.0/12"   ;;
-            192) VOIP_DEST_SUBNET="192.168.0.0/16"  ;;
-            *)
-                echo "  WARNING: unknown first octet $o1, defaulting to 10.0.0.0/8"
-                VOIP_DEST_SUBNET="10.0.0.0/8"
-                ;;
-        esac
-        echo "  IMS subnet : $VOIP_DEST_SUBNET (auto from $voip_ip)"
+        # Resolve P-CSCF now (VoIP interface is up, DNS available from DHCP lease).
+        # We derive the IMS routing subnet from the P-CSCF IP rather than the VoIP
+        # IP, because the P-CSCF is the actual IMS proxy we need to reach — it
+        # directly tells us which RFC-1918 block the IMS lives on.
+        local pcscf_ip=""
+        if [ -n "$PCSCF_HOSTNAME" ]; then
+            echo "  Resolving  : $PCSCF_HOSTNAME (for IMS subnet detection)..."
+            pcscf_ip=$(_resolve_pcscf_ip)
+        fi
+
+        if [ -n "$pcscf_ip" ]; then
+            echo "  P-CSCF     : $pcscf_ip"
+            echo "$pcscf_ip" > "$VOIP_STATE_DIR/pcscf_ip"
+            VOIP_DEST_SUBNET=$(_subnet_from_ip "$pcscf_ip")
+            echo "  IMS subnet : $VOIP_DEST_SUBNET (auto from P-CSCF $pcscf_ip)"
+        else
+            # Fallback: derive subnet from VoIP interface IP
+            [ -n "$PCSCF_HOSTNAME" ] && \
+                echo "  WARNING    : P-CSCF unresolved — falling back to VoIP IP for subnet"
+            VOIP_DEST_SUBNET=$(_subnet_from_ip "$voip_ip")
+            echo "  IMS subnet : $VOIP_DEST_SUBNET (auto from VoIP IP $voip_ip)"
+        fi
     fi
 
     echo "$VOIP_DEST_SUBNET" > "$VOIP_STATE_DIR/subnet"
     echo "$voip_ip"          > "$VOIP_STATE_DIR/voip_ip"
-    echo "  VoIP IP    : $voip_ip"
 }
 
 # ── Gateway detection ─────────────────────────────────────────────────────────
@@ -594,54 +670,29 @@ _routing_teardown() {
 }
 
 # ── P-CSCF resolution ─────────────────────────────────────────────────────────
-# Resolves the ISP's SIP proxy hostname using DNS from the VoIP DHCP lease.
-# The resolved IP is saved to a state file and displayed in the status banner
-# so it can be pasted directly into a SIP client or ATA.
+# Called after routing is set up to confirm/refresh the P-CSCF address.
+# On normal startup _detect_voip_config already resolved and saved the IP, so
+# this function just verifies it. On WAN recovery it re-resolves from scratch.
 
 _resolve_pcscf() {
     [ -z "$PCSCF_HOSTNAME" ] && return 0
+
+    # If _detect_voip_config already resolved it successfully, skip the lookup
+    # (and the sleep) — the state file already has the correct IP.
+    local existing
+    existing=$(cat "$VOIP_STATE_DIR/pcscf_ip" 2>/dev/null || echo "")
+    if echo "$existing" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
+        echo "  P-CSCF: $existing (already resolved)"
+        return 0
+    fi
+
+    # Not resolved yet (e.g. WAN recovery path, or early resolution failed).
+    # Wait briefly for routing + DNS to stabilize before retrying.
     echo "Resolving $PCSCF_HOSTNAME..."
     sleep 3
 
-    local pcscf_ip dns_server iface_index
-    iface_index=$(ip link show "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null \
-        | awk -F': ' 'NR==1{print $1}')
-
-    # Try to get the DNS server from the systemd-networkd lease for this interface
-    if [ -n "$iface_index" ] && [ -f "/run/systemd/netif/leases/$iface_index" ]; then
-        dns_server=$(grep "^DNS=" "/run/systemd/netif/leases/$iface_index" \
-            2>/dev/null | cut -d'=' -f2 | awk '{print $1}')
-    fi
-
-    # Fallback: find lease by IP address
-    if [ -z "$dns_server" ] && [ -n "$VOIP_IP" ]; then
-        local lf
-        lf=$(grep -rl "ADDRESS=$VOIP_IP" /run/systemd/netif/leases/ 2>/dev/null | head -1)
-        [ -n "$lf" ] && \
-            dns_server=$(grep "^DNS=" "$lf" 2>/dev/null | cut -d'=' -f2 | awk '{print $1}')
-    fi
-
-    # Fallback: ask resolvectl
-    [ -z "$dns_server" ] && \
-        dns_server=$(resolvectl dns "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null \
-            | sed 's/.*: //' | tr ' ' '\n' \
-            | grep -E '^[0-9]{1,3}\.' | head -1)
-
-    _debug "DNS: ${dns_server:-(not found)}"
-
-    # Try nslookup, then dig, then getent as progressively broader fallbacks
-    [ -n "$dns_server" ] && command -v nslookup >/dev/null 2>&1 && \
-        pcscf_ip=$(nslookup "$PCSCF_HOSTNAME" "$dns_server" 2>/dev/null \
-            | awk '/^Address:/{print $2}' | grep -Ev '#' \
-            | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
-
-    [ -z "$pcscf_ip" ] && [ -n "$dns_server" ] && command -v dig >/dev/null 2>&1 && \
-        pcscf_ip=$(dig @"$dns_server" +short +time=4 +tries=2 "$PCSCF_HOSTNAME" \
-            2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
-
-    [ -z "$pcscf_ip" ] && command -v getent >/dev/null 2>&1 && \
-        pcscf_ip=$(getent hosts "$PCSCF_HOSTNAME" 2>/dev/null \
-            | awk '{print $1}' | head -1)
+    local pcscf_ip
+    pcscf_ip=$(_resolve_pcscf_ip)
 
     if [ -n "$pcscf_ip" ]; then
         echo "  P-CSCF: $pcscf_ip"
