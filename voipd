@@ -143,14 +143,16 @@ _resolve_pcscf_ip() {
 
     _debug "DNS for P-CSCF lookup: ${dns_server:-(not found)}"
 
-    # nslookup → dig → getent
+    # Use short timeouts — this may be called before PBR routing is active.
+    # If the ISP DNS server is only reachable via the voip table (not yet set up),
+    # the query will fail fast here and succeed later in _resolve_pcscf.
     [ -n "$dns_server" ] && command -v nslookup >/dev/null 2>&1 && \
         pcscf_ip=$(nslookup "$PCSCF_HOSTNAME" "$dns_server" 2>/dev/null \
             | awk '/^Address:/{print $2}' | grep -Ev '#' \
             | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
 
     [ -z "$pcscf_ip" ] && [ -n "$dns_server" ] && command -v dig >/dev/null 2>&1 && \
-        pcscf_ip=$(dig @"$dns_server" +short +time=4 +tries=2 "$PCSCF_HOSTNAME" \
+        pcscf_ip=$(dig @"$dns_server" +short +time=2 +tries=1 "$PCSCF_HOSTNAME" \
             2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
 
     [ -z "$pcscf_ip" ] && command -v getent >/dev/null 2>&1 && \
@@ -200,16 +202,37 @@ _detect_voip_config() {
     if [ -n "$VOIP_IMS_SUBNET" ]; then
         VOIP_DEST_SUBNET="$VOIP_IMS_SUBNET"
         echo "  IMS subnet : $VOIP_DEST_SUBNET (manual override)"
+    elif [ -z "$PCSCF_HOSTNAME" ]; then
+        echo "ERROR: PCSCF_HOSTNAME is not set and VOIP_IMS_SUBNET is not set."
+        echo "       Set PCSCF_HOSTNAME so the IMS subnet can be derived from the"
+        echo "       P-CSCF address, or set VOIP_IMS_SUBNET to override manually."
+        return 1
     else
-        # Resolve P-CSCF now (VoIP interface is up, DNS available from DHCP lease).
-        # We derive the IMS routing subnet from the P-CSCF IP rather than the VoIP
-        # IP, because the P-CSCF is the actual IMS proxy we need to reach — it
-        # directly tells us which RFC-1918 block the IMS lives on.
-        local pcscf_ip=""
-        if [ -n "$PCSCF_HOSTNAME" ]; then
-            echo "  Resolving  : $PCSCF_HOSTNAME (for IMS subnet detection)..."
-            pcscf_ip=$(_resolve_pcscf_ip)
+        # The P-CSCF (IMS SIP proxy) is the authoritative source for the IMS subnet.
+        # Its IP directly tells us which RFC-1918 block all IMS traffic lives on.
+        #
+        # Problem: the ISP DNS server is on the VoIP subnet and is only reachable
+        # after routing table 203 is installed — but we need the subnet to install
+        # routing table 203.  To break this chicken-and-egg dependency we add a
+        # temporary default route via the VoIP gateway just long enough to perform
+        # the DNS lookup, then remove it.  The proper PBR/B2BUA rules are installed
+        # immediately after this function returns.
+        local _tmp_gw
+        _tmp_gw=$(_get_gateway_for_iface "$VOIP_WAN_VLAN_INTERFACE")
+        if [ -n "$_tmp_gw" ]; then
+            ip route add default via "$_tmp_gw" dev "$VOIP_WAN_VLAN_INTERFACE" \
+                metric 50 2>/dev/null || true
+            _debug "Temporary default route via $_tmp_gw for P-CSCF DNS lookup"
         fi
+
+        echo "  Resolving  : $PCSCF_HOSTNAME (for IMS subnet detection)..."
+        local pcscf_ip
+        pcscf_ip=$(_resolve_pcscf_ip)
+
+        # Remove the temporary route immediately regardless of lookup outcome
+        [ -n "$_tmp_gw" ] && \
+            ip route del default via "$_tmp_gw" dev "$VOIP_WAN_VLAN_INTERFACE" \
+                metric 50 2>/dev/null || true
 
         if [ -n "$pcscf_ip" ]; then
             echo "  P-CSCF     : $pcscf_ip"
@@ -217,11 +240,10 @@ _detect_voip_config() {
             VOIP_DEST_SUBNET=$(_subnet_from_ip "$pcscf_ip")
             echo "  IMS subnet : $VOIP_DEST_SUBNET (auto from P-CSCF $pcscf_ip)"
         else
-            # Fallback: derive subnet from VoIP interface IP
-            [ -n "$PCSCF_HOSTNAME" ] && \
-                echo "  WARNING    : P-CSCF unresolved — falling back to VoIP IP for subnet"
-            VOIP_DEST_SUBNET=$(_subnet_from_ip "$voip_ip")
-            echo "  IMS subnet : $VOIP_DEST_SUBNET (auto from VoIP IP $voip_ip)"
+            echo "ERROR: could not resolve $PCSCF_HOSTNAME."
+            echo "       Check that PCSCF_HOSTNAME is correct, or set VOIP_IMS_SUBNET"
+            echo "       in voipd.conf to specify the IMS subnet manually."
+            return 1
         fi
     fi
 
@@ -677,8 +699,7 @@ _routing_teardown() {
 _resolve_pcscf() {
     [ -z "$PCSCF_HOSTNAME" ] && return 0
 
-    # If _detect_voip_config already resolved it successfully, skip the lookup
-    # (and the sleep) — the state file already has the correct IP.
+    # If _detect_voip_config already resolved it successfully, nothing to do.
     local existing
     existing=$(cat "$VOIP_STATE_DIR/pcscf_ip" 2>/dev/null || echo "")
     if echo "$existing" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$'; then
@@ -686,8 +707,9 @@ _resolve_pcscf() {
         return 0
     fi
 
-    # Not resolved yet (e.g. WAN recovery path, or early resolution failed).
-    # Wait briefly for routing + DNS to stabilize before retrying.
+    # State file is missing or contains "(unresolved)" — re-resolve now.
+    # This path is taken on WAN recovery where _detect_voip_config ran while
+    # routing was already active (no temp-route trick needed).
     echo "Resolving $PCSCF_HOSTNAME..."
     sleep 3
 
