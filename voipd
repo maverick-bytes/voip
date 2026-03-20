@@ -590,9 +590,15 @@ _routing_setup_b2bua() {
     grep -q "^$VOIP_RT_TABLE " /etc/iproute2/rt_tables 2>/dev/null \
         || echo "$VOIP_RT_TABLE $VOIP_RT_TABLE_NAME" >> /etc/iproute2/rt_tables
 
+    # Flush any stale state from a previous run
     ip rule del to   "$VOIP_DEST_SUBNET" priority 100 2>/dev/null || true
     ip rule del from "$VOIP_IP"          priority 100 2>/dev/null || true
+    ip rule del fwmark 0x1e0000/0x7e0000 lookup "$VOIP_RT_TABLE" priority 101 2>/dev/null || true
     ip route flush table "$VOIP_RT_TABLE" 2>/dev/null || true
+    while iptables -t mangle -D PREROUTING \
+        -d "$VOIP_DEST_SUBNET" -p udp --dport 5060 -j RETURN 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING \
+        -d "$VOIP_DEST_SUBNET" -p tcp --dport 5060 -j RETURN 2>/dev/null; do :; done
     while iptables -t mangle -D PREROUTING \
         -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null; do :; done
     while iptables -t mangle -D PREROUTING \
@@ -604,18 +610,34 @@ _routing_setup_b2bua() {
     ip route add default via "$gw" dev "$VOIP_WAN_VLAN_INTERFACE" table "$VOIP_RT_TABLE"
     echo "  Table $VOIP_RT_TABLE    : default via $gw dev $VOIP_WAN_VLAN_INTERFACE"
 
-    ip rule add to   "$VOIP_DEST_SUBNET" lookup "$VOIP_RT_TABLE" priority 100
-    ip rule add from "$VOIP_IP"          lookup "$VOIP_RT_TABLE" priority 100
-    echo "  Rules      : to $VOIP_DEST_SUBNET and from $VOIP_IP -> table $VOIP_RT_TABLE (priority 100)"
+    # B2BUA mode intentionally omits 'ip rule to IMS_SUBNET lookup voip'.
+    # That rule would give every LAN client a routed path to the IMS regardless
+    # of firewall zones.  Instead:
+    #   - 'from VOIP_IP'  routes only the B2BUA process's own upstream SIP
+    #   - 'fwmark'        routes marked packets (RTP, established flows)
+    # Port 5060 is excluded from marking (RETURN rules below), so a LAN client
+    # attempting direct IMS SIP gets no route and fails naturally — no DROP rules
+    # needed anywhere.
+    ip rule add from "$VOIP_IP" lookup "$VOIP_RT_TABLE" priority 100
+    ip rule add fwmark 0x1e0000/0x7e0000 lookup "$VOIP_RT_TABLE" priority 101
+    echo "  Rules      : from $VOIP_IP -> table $VOIP_RT_TABLE (priority 100)"
+    echo "  Rules      : fwmark 0x1e0000 -> table $VOIP_RT_TABLE (priority 101)"
 
+    # RETURN port 5060 before MARK — unmarked SIP has no route to the IMS subnet
+    # from a LAN client.  All other traffic (RTP on high ports) is marked normally.
     iptables -t mangle -I PREROUTING 1 \
-        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark 0x1e0000/0x7e0000
+        -d "$VOIP_DEST_SUBNET" -p udp --dport 5060 -j RETURN
     iptables -t mangle -I PREROUTING 2 \
-        -d "$VOIP_DEST_SUBNET" -j CONNMARK --save-mark --nfmask 0x7e0000
+        -d "$VOIP_DEST_SUBNET" -p tcp --dport 5060 -j RETURN
     iptables -t mangle -I PREROUTING 3 \
+        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark 0x1e0000/0x7e0000
+    iptables -t mangle -I PREROUTING 4 \
+        -d "$VOIP_DEST_SUBNET" -j CONNMARK --save-mark --nfmask 0x7e0000
+    iptables -t mangle -I PREROUTING 5 \
         -m connmark --mark 0x1e0000/0x7e0000 \
         -j CONNMARK --restore-mark --nfmask 0x7e0000
-    echo "  Mangle     : PREROUTING dst $VOIP_DEST_SUBNET -> MARK + CONNMARK save/restore"
+    echo "  Mangle     : RETURN port 5060 to $VOIP_DEST_SUBNET (no mark = no route for LAN)"
+    echo "  Mangle     : MARK+CONNMARK other traffic to $VOIP_DEST_SUBNET (RTP)"
 
     iptables -t nat -C "$UBIOS_NAT_CHAIN" \
         -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE 2>/dev/null \
@@ -627,7 +649,7 @@ _routing_setup_b2bua() {
 
     iptables -C UBIOS_LAN_IN_USER -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
         || iptables -I UBIOS_LAN_IN_USER 1 -d "$VOIP_DEST_SUBNET" -j ACCEPT
-    echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET"
+    echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET (RTP)"
 }
 
 _routing_teardown_b2bua() {
@@ -637,11 +659,15 @@ _routing_teardown_b2bua() {
 
     _b2bua_stop
 
-    ip rule del to "$subnet" priority 100              2>/dev/null || true
     [ -n "$voip_ip" ] && \
         ip rule del from "$voip_ip" priority 100       2>/dev/null || true
+    ip rule del fwmark 0x1e0000/0x7e0000 lookup "$VOIP_RT_TABLE" priority 101 2>/dev/null || true
     ip route flush table "$VOIP_RT_TABLE"               2>/dev/null || true
 
+    iptables -t mangle -D PREROUTING \
+        -d "$subnet" -p udp --dport 5060 -j RETURN 2>/dev/null || true
+    iptables -t mangle -D PREROUTING \
+        -d "$subnet" -p tcp --dport 5060 -j RETURN 2>/dev/null || true
     iptables -t mangle -D PREROUTING \
         -d "$subnet" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null || true
     iptables -t mangle -D PREROUTING \
@@ -878,6 +904,17 @@ _rules_ensure() {
                 echo "  [watchdog] B2BUA process died, restarting..."
                 _b2bua_start
             fi
+        fi
+        if [ "$mode" = "b2bua" ]; then
+            # Keep port 5060 RETURN rules in place so direct IMS SIP stays
+            # unroutable from LAN clients (no mark = no fwmark rule = no route).
+            for _proto in udp tcp; do
+                iptables -t mangle -C PREROUTING \
+                    -d "$subnet" -p "$_proto" --dport 5060 -j RETURN 2>/dev/null \
+                || { iptables -t mangle -I PREROUTING 1 \
+                         -d "$subnet" -p "$_proto" --dport 5060 -j RETURN
+                     echo "  [watchdog] restored mangle RETURN ($_proto:5060 → $subnet)"; }
+            done
         fi
     fi
 
