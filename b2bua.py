@@ -53,7 +53,7 @@ def new_call_id(): return f'{_rnd(16)}@b2bua'
 def new_tag():     return _rnd(8)
 def _md5(s):       return hashlib.md5(s.encode()).hexdigest()
 
-def _build_auth(method, uri, user, pw, challenge, hdr='Authorization'):
+def _build_auth(method, uri, user, pw, challenge, hdr='Authorization', nc_val=None):
     rm  = re.search(r'realm="([^"]+)"',      challenge, re.I)
     nm  = re.search(r'nonce="([^"]+)"',      challenge, re.I)
     qm  = re.search(r'qop="([^"]+)"',        challenge, re.I)
@@ -62,14 +62,16 @@ def _build_auth(method, uri, user, pw, challenge, hdr='Authorization'):
     realm=rm.group(1); nonce=nm.group(1)
     qop=(qm.group(1).split(',')[0].strip() if qm else '')
     algo=(am.group(1).upper() if am else 'MD5')
-    nc='00000001'; cnonce=_rnd(8)
+    # nc must increment for each use of the same nonce (replay protection)
+    nc = f'{nc_val:08x}' if nc_val else '00000001'
+    cnonce=_rnd(8)
     ha1=_md5(f'{user}:{realm}:{pw}'); ha2=_md5(f'{method}:{uri}')
     resp=(_md5(f'{ha1}:{nonce}:{nc}:{cnonce}:{qop}:{ha2}') if qop
           else _md5(f'{ha1}:{nonce}:{ha2}'))
     h=(f'Digest username="{user}",realm="{realm}",'
        f'nonce="{nonce}",uri="{uri}",response="{resp}",algorithm={algo}')
     if qop: h+=f',qop={qop},nc={nc},cnonce="{cnonce}"'
-    log.debug(f'Auth: realm={realm} algo={algo} qop={qop}')
+    log.debug(f'Auth: realm={realm} algo={algo} qop={qop} nc={nc}')
     return h
 
 _COMPACT={'v':'via','f':'from','t':'to','i':'call-id','m':'contact',
@@ -130,6 +132,62 @@ def _user_from_uri(uri_str):
     m=re.search(r'sips?:([^@;?>\s]+)@',uri_str)
     return m.group(1) if m else ''
 
+def _hdr_uri_list(hval):
+    uris=[u.strip() for u in re.findall(r'<([^>]+)>', hval or '') if u.strip()]
+    if uris:
+        return uris
+    v=(hval or '').strip()
+    return [v] if v else []
+
+def _preferred_identity(uris):
+    for uri in uris or []:
+        if ';user=phone' in uri.lower():
+            return uri
+    for uri in uris or []:
+        if _user_from_uri(uri) == SIP_USER:
+            return uri
+    if uris:
+        return uris[0]
+    return f'sip:{SIP_USER}@{SIP_DOMAIN}'
+
+def _local_user(default=''):
+    return LOCAL_USER or default or SIP_USER
+
+def _local_contact(default=''):
+    return f'<sip:{_local_user(default)}@{VOIP_IP}:{LOCAL_PORT}>'
+
+def _up_invite_resp_hdrs(dlg, to_hdr):
+    via_hdrs=[('via', v) for v in (getattr(dlg, 'up_vias', []) or [])]
+    return via_hdrs+[
+        ('from', dlg.up_from),
+        ('to', to_hdr),
+        ('call-id', dlg.up_id),
+        ('cseq', getattr(dlg, 'up_req_cseq', '1 INVITE')),
+        ('contact', f'<sip:{SIP_USER}@{VOIP_IP}:{LOCAL_PORT}>'),
+    ]
+
+def _up_uri(local_ruri):
+    uri=_uri(local_ruri).strip()
+    if not uri:
+        return f'sip:{SIP_DOMAIN}'
+
+    if uri.lower().startswith('tel:'):
+        callee=re.sub(r'\s+', '', uri[4:])
+        return f'sip:{callee}@{SIP_DOMAIN};user=phone'
+
+    params=''
+    for param in re.findall(r';([^;>\s?]+)', uri):
+        key=param.split('=',1)[0].lower()
+        if key in ('user', 'phone-context'):
+            params+=f';{param}'
+
+    callee=_user_from_uri(uri)
+    if not callee:
+        callee=re.sub(r'^sips?:', '', uri.split('@')[0].split(';')[0])
+    if callee and all(ch.isdigit() or ch in '+*#' for ch in callee) and ';user=' not in params.lower():
+        params+=';user=phone'
+    return f'sip:{callee}@{SIP_DOMAIN}{params}'
+
 def _cseq_num(hval):
     m=re.match(r'\s*(\d+)',hval)
     return int(m.group(1)) if m else 1
@@ -137,6 +195,26 @@ def _cseq_num(hval):
 def _cseq_method(hval):
     p=hval.split(None,1)
     return p[1].strip() if len(p)>1 else ''
+
+def _map_upstream_final_response(st, reason, msg):
+    """Translate carrier-specific 403 finals into clearer client-facing SIP codes.
+
+    Huawei/IMS sometimes returns 403 for busy/rejected destinations. Mapping those
+    to standard UAC-facing statuses keeps softphones from mistaking busy callee
+    conditions for auth/permission failures.
+    """
+    if st != 403:
+        return st, reason
+
+    warning = ' '.join(v for n, v in msg.get('headers', []) if n == 'warning').lower()
+    reason_hdr = ' '.join(v for n, v in msg.get('headers', []) if n == 'reason').lower()
+    detail = f'{warning} {reason_hdr}'
+
+    if 'busy' in detail or 'cause=17' in detail:
+        return 486, 'Busy Here'
+    if 'call rejected' in detail or 'cause=21' in detail:
+        return 603, 'Decline'
+    return st, reason
 
 def _build(first_line,headers,body=b''):
     lines=[first_line]; has_cl=False
@@ -256,9 +334,9 @@ def _tcp_conn_for(addr):
 
 # ── State ──────────────────────────────────────────────────────────────────────
 class _Reg:
-    __slots__=('contact','addr','expires','call_id','username','transport','conn')
-    def __init__(self,contact,addr,expires,call_id,username='',transport='udp',conn=None):
-        self.contact=contact; self.addr=addr; self.expires=expires
+    __slots__=('contact','aor','addr','expires','call_id','username','transport','conn')
+    def __init__(self,contact,aor,addr,expires,call_id,username='',transport='udp',conn=None):
+        self.contact=contact; self.aor=aor; self.addr=addr; self.expires=expires
         self.call_id=call_id; self.username=username
         self.transport=transport; self.conn=conn
 
@@ -266,10 +344,11 @@ class _Dialog:
     def __init__(self,direction='out'):
         self.direction=direction
         self.lc_id=''; self.lc_addr=None; self.lc_from=''
-        self.lc_to=''; self.lc_tag=''; self.lc_cseq=1; self.lc_branch=''
+        self.lc_target=''; self.lc_to=''; self.lc_peer_to=''; self.lc_tag=''; self.lc_cseq=1; self.lc_branch=''
         self.lc_vias=[]; self.lc_transport='udp'; self.lc_conn=None
         self.lc_body=b''          # stored SDP body for outbound auth retry
-        self.up_id=''; self.up_from=''; self.up_to=''
+        self.up_id=''; self.up_from=''; self.up_to=''; self.up_identity=''
+        self.up_vias=[]; self.up_req_cseq='1 INVITE'
         self.up_to_tag=''; self.up_cseq=1; self.up_branch=''
         self.up_routes=[]         # Route headers used in INVITE (required in ACK per RFC 3261)
         self.up_contact=None      # Contact URI from IMS 200 OK (for ACK routing)
@@ -281,14 +360,18 @@ class _Fork:
     """Tracks all parallel fork legs for one inbound call from the IMS.
     All legs ring simultaneously; the first 200 OK wins and the others are CANCELled.
     """
-    def __init__(self, up_id, up_from, up_to):
-        self.up_id     = up_id
-        self.up_from   = up_from
-        self.up_to     = up_to
-        self.legs      = {}     # lc_id -> _Dialog for each fork leg
-        self.answered  = False  # True once first 200 accepted
-        self.prov_sent = False  # True once first 180/183 relayed upstream
-        self.lock      = threading.Lock()
+    def __init__(self, up_id, up_from, up_to, up_vias=None, up_req_cseq='1 INVITE'):
+        self.up_id       = up_id
+        self.up_from     = up_from
+        self.up_to       = up_to
+        self.up_vias     = list(up_vias or [])
+        self.up_req_cseq = up_req_cseq
+        self.up_to_tag   = ''
+        self.legs        = {}     # lc_id -> _Dialog for each fork leg
+        self.answered    = False  # True once first 200 accepted
+        self.cancelled   = False  # True once upstream CANCEL was processed
+        self.prov_sent   = False  # True once first 180/183 relayed upstream
+        self.lock        = threading.Lock()
 
 _regs={}; _regs_lock=threading.Lock()
 _dlg_by_up={}; _dlg_by_lc={}; _dlg_lock=threading.Lock()
@@ -296,10 +379,14 @@ _forks={}; _forks_lock=threading.Lock()
 
 # ── Upstream registration ──────────────────────────────────────────────────────
 _ureg={'registered':False,'challenge':None,'call_id':None,'cseq':1,
-       'from_tag':None,'service_route':[]}
+       'from_tag':None,'service_route':[],'associated_uri':[],
+       'nc':0,'invite_nc':2}
 _ureg_lock=threading.Lock()
 
 def _send_register(with_auth=False):
+    # Periodic re-registration always starts WITHOUT auth to get a fresh nonce.
+    # The IMS sends 401 with new nonce → we reply with nc=1.
+    # This keeps nc permanently bounded at 1 for REGISTER.
     if not _ureg.get('from_tag'): _ureg['from_tag']=new_tag()
     cid=_ureg.get('call_id') or new_call_id(); _ureg['call_id']=cid
     seq=_ureg['cseq']; uri=f'sip:{SIP_DOMAIN}'
@@ -315,7 +402,8 @@ def _send_register(with_auth=False):
         ('supported',   'path,gruu'),
     ]
     if with_auth and _ureg.get('challenge'):
-        h=_build_auth('REGISTER',uri,SIP_USER,SIP_PASS,_ureg['challenge'])
+        _ureg['nc'] = _ureg.get('nc', 0) + 1   # monotonic nc for REGISTER only (INVITEs do not use pre-auth)
+        h=_build_auth('REGISTER',uri,SIP_USER,SIP_PASS,_ureg['challenge'],nc_val=_ureg['nc'])
         if h: hdrs.append(('authorization',h))
     _ureg['cseq']+=1
     raw=_build(f'REGISTER {uri} SIP/2.0',hdrs)
@@ -330,7 +418,9 @@ def _register_loop():
     while True:
         with _ureg_lock:
             is_reg = _ureg.get('registered', False)
-        interval = 30 if not is_reg else max(30, REG_EXPIRES // 2)
+        # Always 30s — IMS nonce for INVITE auth has short TTL (~90-120s).
+        # invite_nc resets to 2 on each fresh nonce so nc stays at 2-5 max.
+        interval = 30
         time.sleep(interval)
         try:
             with _ureg_lock:
@@ -340,13 +430,17 @@ def _register_loop():
                         log.warning(f'register_loop: {_retry_count} failed retries — resetting dialog')
                         _ureg['call_id']=None; _ureg['from_tag']=None
                         _ureg['cseq']=1; _ureg['challenge']=None
+                        _ureg['nc']=0; _ureg['invite_nc']=2
                         _retry_count=0
                         _send_register(False)
                     else:
                         _send_register(bool(_ureg.get('challenge')))
                 else:
                     _retry_count=0
-                    _send_register(bool(_ureg.get('challenge')))
+                    # Always send periodic re-reg WITHOUT auth so IMS issues
+                    # a fresh nonce each cycle via 401. The 401 handler then
+                    # responds with nc=1, keeping nc permanently bounded.
+                    _send_register(False)
         except Exception as exc: log.warning(f'register_loop:{exc}')
 
 def _on_register_resp(msg,raw=b''):
@@ -356,13 +450,21 @@ def _on_register_resp(msg,raw=b''):
             _ureg['registered']=True
             sr=[v for n,v in msg.get('headers',[]) if n=='service-route']
             _ureg['service_route']=sr
+            assoc=[]
+            for n,v in msg.get('headers',[]):
+                if n=='p-associated-uri':
+                    assoc.extend(_hdr_uri_list(v))
+            _ureg['associated_uri']=assoc
             if sr: log.info(f'Service-Route: {sr[0][:60]}')
             log.info(f'*** Upstream registered: {SIP_USER}@{SIP_DOMAIN} ***')
             _write_state()
         elif st==401:
             chal=_gh(msg,'www-authenticate')
             if chal:
+                # New challenge = new nonce, reset nc counter
                 _ureg['challenge']=chal; _ureg['registered']=False
+                _ureg['nc']=0          # reset register nc for fresh nonce
+                _ureg['invite_nc']=2   # INVITE nc starts at 2 (nc=1 used by REGISTER)
                 _send_register(True)
         elif st==403:
             log.error(f'REGISTER 403 — user={SIP_USER}')
@@ -374,7 +476,7 @@ def _on_register_resp(msg,raw=b''):
 # AOR is keyed by username@source_ip:source_port so that:
 #   - Two devices at different IPs get separate slots
 #   - One device registering on both UDP and TCP gets separate slots (different port)
-#   - Domain in From header (192.168.5.1 vs voip.ims.example.com) is ignored
+#   - Domain in From header is ignored
 # TCP ports change on reconnect; the old slot expires naturally within its TTL.
 
 def _aor(from_val, addr=None):
@@ -391,6 +493,7 @@ def _on_local_register(msg,addr,transport='udp',conn=None):
     # Key by username@source_ip:port — domain in From header is irrelevant
     aor=_aor(from_val, addr)
     local_username=_user_from_uri(_uri(from_val)) or SIP_USER
+    aor_hdr=_gh(msg,'to') or from_val
 
     if LOCAL_PASS:
         auth=_gh(msg,'authorization')
@@ -423,7 +526,7 @@ def _on_local_register(msg,addr,transport='udp',conn=None):
         if expires==0:
             _regs.pop(aor,None); log.info(f'Unregistered {local_username} @ {addr[0]}')
         else:
-            _regs[aor]=_Reg(cont_uri,addr,time.time()+expires,call_id,
+            _regs[aor]=_Reg(cont_uri,aor_hdr,addr,time.time()+expires,call_id,
                             local_username,transport,conn)
             log.info(f'Registered {local_username} @ {addr[0]}:{addr[1]} '
                      f'({transport.upper()} exp={expires}s)')
@@ -432,18 +535,12 @@ def _on_local_register(msg,addr,transport='udp',conn=None):
     if not _tag(to_val): to_val+=f';tag={new_tag()}'
     _send(_respond(msg,200,'OK',extra=[
         ('to',to_val),
-        ('contact',f'<sip:{SIP_USER}@{VOIP_IP}:{LOCAL_PORT}>'),
+        ('contact',_local_contact(local_username)),
         ('expires',str(expires)),
     ],addr=addr),addr,transport,conn)
     _write_state()
 
 # ── Outbound: local client -> IMS ──────────────────────────────────────────────
-def _up_uri(local_ruri):
-    callee=_user_from_uri(local_ruri)
-    if not callee:
-        callee=re.sub(r'sips?:','',local_ruri.split('@')[0].split(';')[0])
-    return f'sip:{callee}@{SIP_DOMAIN}'
-
 def _on_local_invite(msg,addr,transport='udp',conn=None):
     lc_id=_gh(msg,'call-id'); from_val=_gh(msg,'from')
     to_val=_gh(msg,'to'); cseq_val=_gh(msg,'cseq'); body=msg.get('body',b'')
@@ -472,6 +569,7 @@ def _on_local_invite(msg,addr,transport='udp',conn=None):
     dlg.lc_transport=transport; dlg.lc_conn=conn
     dlg.lc_body=body  # stored for potential auth retry
     dlg.up_id=new_call_id(); dlg.up_branch=new_branch()
+    dlg.up_identity=''
     dlg.up_from=f'<sip:{SIP_USER}@{SIP_DOMAIN}>;tag={new_tag()}'
     dlg.up_to=f'<{up_req_uri}>'; dlg.up_cseq=1
 
@@ -481,16 +579,30 @@ def _on_local_invite(msg,addr,transport='udp',conn=None):
         ('call-id',     dlg.up_id),('cseq','1 INVITE'),
         ('contact',     f'<sip:{SIP_USER}@{VOIP_IP}:{LOCAL_PORT}>'),
         ('max-forwards','70'),('user-agent','voipd-b2bua/1.4'),
-        ('allow',       'INVITE,ACK,BYE,CANCEL,OPTIONS'),('supported','path'),
+        ('allow',       'INVITE,ACK,BYE,CANCEL,UPDATE,INFO,SUBSCRIBE,NOTIFY,REFER,MESSAGE,OPTIONS'),
+        ('supported',   'path,replaces,timer,norefersub'),
+        ('session-expires','1800'),
+        ('min-se',      '90'),
     ]
     with _ureg_lock:
+        dlg.up_identity=_preferred_identity(_ureg.get('associated_uri',[]))
+        if dlg.up_identity:
+            up_hdrs.append(('p-preferred-identity', f'<{dlg.up_identity}>'))
+        up_hdrs.append(('p-called-party-id', f'<{up_req_uri}>'))
         for sr in _ureg.get('service_route',[]):
             up_hdrs.insert(0,('route',sr))
         dlg.up_routes = [sr for sr in _ureg.get('service_route',[])]
+        # Pre-emptive Proxy-Authorization: IMS requires auth on INVITE.
+        # It does NOT send 407 — it returns 403 'Invalid User' if auth is absent.
+        # Use invite_nc (separate from REGISTER nc=1) so REGISTER's nc=1 never
+        # conflicts with INVITE nc=2,3,4... invite_nc resets to 2 on new nonce.
         if _ureg.get('challenge'):
-            h=_build_auth('INVITE',up_req_uri,SIP_USER,SIP_PASS,
-                          _ureg['challenge'],'Proxy-Authorization')
-            if h: up_hdrs.append(('proxy-authorization',h))
+            nc = _ureg.get('invite_nc', 2)
+            _ureg['invite_nc'] = nc + 1
+            h = _build_auth('INVITE', up_req_uri, SIP_USER, SIP_PASS,
+                            _ureg['challenge'], 'Proxy-Authorization', nc_val=nc)
+            if h: up_hdrs.append(('proxy-authorization', h))
+            log.debug(f'INVITE pre-auth: nonce=...{_ureg["challenge"][-8:]} nc={nc:08x}')
     if body: up_hdrs.append(('content-type','application/sdp'))
 
     with _dlg_lock:
@@ -524,7 +636,8 @@ def _on_upstream_invite_resp(msg,raw=b''):
                 _send(_build(f'ACK {_uri(dlg.up_to)} SIP/2.0', ack_hdrs), (PROXY_IP, PROXY_PORT))
                 auth_key = 'authorization' if st == 401 else 'proxy-authorization'
                 h = _build_auth('INVITE', _uri(dlg.up_to), SIP_USER, SIP_PASS, chal,
-                                'Authorization' if st == 401 else 'Proxy-Authorization')
+                                'Authorization' if st == 401 else 'Proxy-Authorization',
+                                nc_val=1)
                 if h:
                     dlg.up_branch = new_branch()
                     dlg.up_cseq   = 2
@@ -534,9 +647,15 @@ def _on_upstream_invite_resp(msg,raw=b''):
                         ('call-id', dlg.up_id),   ('cseq', f'{dlg.up_cseq} INVITE'),
                         ('contact', f'<sip:{SIP_USER}@{VOIP_IP}:{LOCAL_PORT}>'),
                         ('max-forwards','70'), ('user-agent','voipd-b2bua/1.4'),
-                        ('allow',   'INVITE,ACK,BYE,CANCEL,OPTIONS'), ('supported','path'),
+                        ('allow',   'INVITE,ACK,BYE,CANCEL,UPDATE,INFO,SUBSCRIBE,NOTIFY,REFER,MESSAGE,OPTIONS'),
+                        ('supported','path,replaces,timer,norefersub'),
+                        ('session-expires','1800'),
+                        ('min-se',  '90'),
                         (auth_key,  h),
                     ]
+                    if getattr(dlg, 'up_identity', ''):
+                        retry_hdrs.append(('p-preferred-identity', f'<{dlg.up_identity}>'))
+                    retry_hdrs.append(('p-called-party-id', f'<{_uri(dlg.up_to)}>'))
                     with _ureg_lock:
                         for sr in _ureg.get('service_route',[]):
                             retry_hdrs.insert(0,('route',sr))
@@ -549,6 +668,24 @@ def _on_upstream_invite_resp(msg,raw=b''):
         # ── end auth retry ─────────────────────────────────────────────────────
 
         if st>=200 and not dlg.up_to_tag: dlg.up_to_tag=_tag(_gh(msg,'to'))
+        if st>=300:
+            # ACK non-2xx finals on the IMS leg immediately; the client's ACK
+            # is for the downstream dialog and does not complete this leg.
+            ack_to = dlg.up_to
+            if dlg.up_to_tag and 'tag=' not in ack_to:
+                ack_to += f';tag={dlg.up_to_tag}'
+            ack_hdrs=[
+                ('via',         f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()};rport'),
+                ('from',        dlg.up_from),
+                ('to',          ack_to),
+                ('call-id',     dlg.up_id),
+                ('cseq',        f'{dlg.up_cseq} ACK'),
+                ('max-forwards','70'),
+            ]
+            for route in reversed(getattr(dlg, 'up_routes', []) or []):
+                ack_hdrs.insert(0, ('route', route))
+            _send(_build(f'ACK {_uri(dlg.up_to)} SIP/2.0', ack_hdrs),
+                  (PROXY_IP, PROXY_PORT))
         if st==200 and not dlg.up_contact:
             # Store Contact from 200 OK for RFC-3261-compliant ACK routing
             cont = _gh(msg, 'contact')
@@ -569,6 +706,7 @@ def _on_upstream_invite_resp(msg,raw=b''):
 
         parts=msg.get('first_line','').split(None,2)
         reason=parts[2] if len(parts)>2 else 'OK'; body=msg.get('body',b'')
+        local_st, local_reason = _map_upstream_final_response(st, reason, msg)
         to_hdr=dlg.lc_to
         if not _tag(to_hdr): to_hdr+=f';tag={dlg.lc_tag}'
         via_hdrs=[('via',v) for v in
@@ -576,12 +714,16 @@ def _on_upstream_invite_resp(msg,raw=b''):
         lc_hdrs=via_hdrs+[
             ('from',dlg.lc_from),('to',to_hdr),('call-id',dlg.lc_id),
             ('cseq',f'{dlg.lc_cseq} INVITE'),
-            ('contact',f'<sip:{SIP_USER}@{VOIP_IP}:{LOCAL_PORT}>'),
+            ('contact',_local_contact(_user_from_uri(_uri(dlg.lc_from)))),
         ]
+        for hdr_name in ('warning', 'reason'):
+            hdr_val = _gh(msg, hdr_name)
+            if hdr_val:
+                lc_hdrs.append((hdr_name, hdr_val))
         if body: lc_hdrs.append(('content-type','application/sdp'))
-        _send(_build(f'SIP/2.0 {st} {reason}',lc_hdrs,body),
+        _send(_build(f'SIP/2.0 {local_st} {local_reason}',lc_hdrs,body),
               dlg.lc_addr,dlg.lc_transport,dlg.lc_conn)
-        log.info(f'-> {st} {reason} to {dlg.lc_addr[0]}')
+        log.info(f'-> {local_st} {local_reason} to {dlg.lc_addr[0]}')
         if st>=400: _cleanup_dlg(dlg)
 
 def _on_local_ack(msg,addr,transport='udp',conn=None):
@@ -636,10 +778,60 @@ def _on_local_cancel(msg,addr,transport='udp',conn=None):
         _send(_build(f'CANCEL {_uri(dlg.up_to)} SIP/2.0',hdrs),(PROXY_IP,PROXY_PORT))
         _cleanup_dlg(dlg)
 
+
+def _ack_local_invite_final(dlg, to_hdr):
+    hdrs=[
+        ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
+        ('from',dlg.lc_from),('to',to_hdr),
+        ('call-id',dlg.lc_id),('cseq','1 ACK'),('max-forwards','70'),
+    ]
+    _send(_build(f'ACK {dlg.lc_target or _uri(dlg.lc_to)} SIP/2.0',hdrs),
+          dlg.lc_addr,dlg.lc_transport,dlg.lc_conn)
+
+
+def _on_upstream_cancel(msg,raw=b''):
+    call_id=_gh(msg,'call-id')
+    _log_sip('<<UP CAN',(PROXY_IP,PROXY_PORT),raw)
+    with _forks_lock:
+        fork=_forks.get(call_id)
+
+    if not fork:
+        _send(_respond(msg,481,'Call Does Not Exist'),(PROXY_IP,PROXY_PORT))
+        return
+
+    with fork.lock:
+        _send(_respond(msg,200,'OK'),(PROXY_IP,PROXY_PORT))
+        if fork.answered or fork.cancelled:
+            return
+
+        fork.cancelled=True
+        if not fork.up_to_tag:
+            fork.up_to_tag=new_tag()
+        to_hdr=fork.up_to
+        if not _tag(to_hdr):
+            to_hdr+=f';tag={fork.up_to_tag}'
+        _send(_build('SIP/2.0 487 Request Terminated',
+                     _up_invite_resp_hdrs(fork,to_hdr)),
+              (PROXY_IP,PROXY_PORT))
+        log.info(f'Inbound CANCEL — cancelling {len(fork.legs)} local leg(s)')
+
+        for dlg in list(fork.legs.values()):
+            if dlg.state in ('trying','proceeding'):
+                dlg.state='cancelled'
+                hdrs=[
+                    ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={dlg.lc_branch}'),
+                    ('from',fork.up_from),('to',dlg.lc_to),
+                    ('call-id',dlg.lc_id),('cseq','1 CANCEL'),('max-forwards','70'),
+                ]
+                _send(_build(f'CANCEL {dlg.lc_target or _uri(dlg.lc_to)} SIP/2.0',hdrs),
+                      dlg.lc_addr,dlg.lc_transport,dlg.lc_conn)
+
 # ── Inbound: IMS -> all local clients (parallel fork) ─────────────────────────
 def _on_upstream_invite(msg,raw=b''):
     from_val=_gh(msg,'from'); to_val=_gh(msg,'to')
     call_id=_gh(msg,'call-id'); body=msg.get('body',b'')
+    up_vias=[v for n,v in msg.get('headers',[]) if n=='via']
+    up_req_cseq=_gh(msg,'cseq') or '1 INVITE'
     _log_sip('<<UP IN',(PROXY_IP,PROXY_PORT),raw)
     _send(_respond(msg,100,'Trying'),(PROXY_IP,PROXY_PORT))
 
@@ -651,7 +843,7 @@ def _on_upstream_invite(msg,raw=b''):
                         extra=[('to',to_val+f';tag={new_tag()}')]),(PROXY_IP,PROXY_PORT))
         return
 
-    fork = _Fork(call_id, from_val, to_val)
+    fork = _Fork(call_id, from_val, to_val, up_vias, up_req_cseq)
     with _forks_lock:
         _forks[call_id] = fork
 
@@ -659,10 +851,14 @@ def _on_upstream_invite(msg,raw=b''):
     for aor, reg in live:
         dlg=_Dialog('in')
         dlg.up_id=call_id; dlg.up_from=from_val; dlg.up_to=to_val
+        dlg.up_vias=list(up_vias); dlg.up_req_cseq=up_req_cseq
         dlg.lc_id=new_call_id(); dlg.lc_addr=reg.addr
         dlg.lc_tag=new_tag(); dlg.lc_branch=new_branch()
         dlg.lc_from=from_val; dlg.lc_transport=reg.transport; dlg.lc_conn=reg.conn
-        dlg.lc_to=f'<sip:{SIP_USER}@{VOIP_IP}:{LOCAL_PORT}>'
+        dlg.lc_target=_uri(reg.contact) if reg.contact else f'sip:{_local_user(reg.username)}@{reg.addr[0]}:{reg.addr[1]}'
+        dlg.lc_to=reg.aor or _local_contact(reg.username)
+        if '<' not in dlg.lc_to:
+            dlg.lc_to=f'<{_uri(dlg.lc_to)}>'
         fork.legs[dlg.lc_id] = dlg
         with _dlg_lock:
             _dlg_by_lc[dlg.lc_id] = dlg
@@ -670,11 +866,11 @@ def _on_upstream_invite(msg,raw=b''):
             ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={dlg.lc_branch};rport'),
             ('from',    from_val), ('to', dlg.lc_to), ('call-id', dlg.lc_id),
             ('cseq',    '1 INVITE'),
-            ('contact', f'<sip:{SIP_USER}@{VOIP_IP}:{LOCAL_PORT}>'),
+            ('contact', _local_contact(reg.username)),
             ('max-forwards','70'),
         ]
         if body: lc_hdrs.append(('content-type','application/sdp'))
-        _send(_build(f'INVITE {dlg.lc_to} SIP/2.0',lc_hdrs,body),
+        _send(_build(f'INVITE {dlg.lc_target} SIP/2.0',lc_hdrs,body),
               reg.addr,reg.transport,reg.conn)
         log.info(f'  -> fork leg {dlg.lc_id[:8]} to {reg.addr[0]}:{reg.addr[1]} ({reg.transport.upper()})')
 
@@ -685,6 +881,8 @@ def _on_local_invite_resp(msg,addr,transport='udp',conn=None):
 
     parts=msg.get('first_line','').split(None,2)
     reason=parts[2] if len(parts)>2 else 'OK'
+    to_resp=_gh(msg,'to') or dlg.lc_to
+    dlg.lc_peer_to = to_resp
 
     with _forks_lock:
         fork = _forks.get(dlg.up_id)
@@ -694,59 +892,78 @@ def _on_local_invite_resp(msg,addr,transport='udp',conn=None):
         if st==200:
             to_hdr=dlg.up_to
             if not _tag(to_hdr): to_hdr+=f';tag={dlg.lc_tag}'
-            up_hdrs=[
-                ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
-                ('from',dlg.up_from),('to',to_hdr),('call-id',dlg.up_id),
-                ('cseq','1 INVITE'),('contact',f'<sip:{SIP_USER}@{VOIP_IP}:{LOCAL_PORT}>'),
-            ]
+            up_hdrs=_up_invite_resp_hdrs(dlg, to_hdr)
             if body: up_hdrs.append(('content-type','application/sdp'))
             _send(_build(f'SIP/2.0 200 OK',up_hdrs,body),(PROXY_IP,PROXY_PORT))
             with _dlg_lock: _dlg_by_up[dlg.up_id]=dlg
         elif st>=400:
+            _ack_local_invite_final(dlg, to_resp)
             _cleanup_dlg(dlg)
         return
 
     with fork.lock:
         # ── Provisional (180/183) — relay first one upstream ─────────────────
         if 180<=st<=199:
-            if not fork.answered and not fork.prov_sent:
+            dlg.state='proceeding'
+            if not fork.answered and not fork.cancelled and not fork.prov_sent:
                 fork.prov_sent = True
-                to_hdr = fork.up_to + f';tag={dlg.lc_tag}'
-                up_hdrs=[
-                    ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
-                    ('from',fork.up_from),('to',to_hdr),('call-id',fork.up_id),
-                    ('cseq','1 INVITE'),('contact',f'<sip:{SIP_USER}@{VOIP_IP}:{LOCAL_PORT}>'),
-                ]
+                if not fork.up_to_tag:
+                    fork.up_to_tag = dlg.lc_tag
+                to_hdr = fork.up_to
+                if not _tag(to_hdr):
+                    to_hdr += f';tag={fork.up_to_tag}'
+                up_hdrs=_up_invite_resp_hdrs(fork, to_hdr)
                 if body: up_hdrs.append(('content-type','application/sdp'))
                 _send(_build(f'SIP/2.0 {st} {reason}',up_hdrs,body),(PROXY_IP,PROXY_PORT))
             return
 
         # ── 200 OK — first one wins ───────────────────────────────────────────
         if st==200:
-            if not fork.answered:
+            if fork.cancelled:
+                ack_hdrs=[
+                    ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
+                    ('from',dlg.lc_from),('to',to_resp),
+                    ('call-id',dlg.lc_id),('cseq','1 ACK'),('max-forwards','70'),
+                ]
+                _send(_build(f'ACK {dlg.lc_target or _uri(dlg.lc_to)} SIP/2.0',ack_hdrs),
+                      dlg.lc_addr,dlg.lc_transport,dlg.lc_conn)
+                bye_hdrs=[
+                    ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
+                    ('from',dlg.lc_from),('to',to_resp),
+                    ('call-id',dlg.lc_id),('cseq','2 BYE'),('max-forwards','70'),
+                ]
+                _send(_build(f'BYE {dlg.lc_target or _uri(dlg.lc_to)} SIP/2.0',bye_hdrs),
+                      dlg.lc_addr,dlg.lc_transport,dlg.lc_conn)
+                dlg.state='terminated'
+                fork.legs.pop(call_id, None)
+                with _dlg_lock: _dlg_by_lc.pop(call_id,None)
+                if not fork.legs:
+                    with _forks_lock: _forks.pop(fork.up_id, None)
+                    with _dlg_lock:   _dlg_by_up.pop(fork.up_id, None)
+            elif not fork.answered:
                 fork.answered = True
                 dlg.state = 'established'
                 with _dlg_lock:
                     _dlg_by_up[fork.up_id] = dlg  # winning leg
-                to_hdr = fork.up_to + f';tag={dlg.lc_tag}'
-                up_hdrs=[
-                    ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
-                    ('from',fork.up_from),('to',to_hdr),('call-id',fork.up_id),
-                    ('cseq','1 INVITE'),('contact',f'<sip:{SIP_USER}@{VOIP_IP}:{LOCAL_PORT}>'),
-                ]
+                if not fork.up_to_tag:
+                    fork.up_to_tag = dlg.lc_tag
+                to_hdr = fork.up_to
+                if not _tag(to_hdr):
+                    to_hdr += f';tag={fork.up_to_tag}'
+                up_hdrs=_up_invite_resp_hdrs(fork, to_hdr)
                 if body: up_hdrs.append(('content-type','application/sdp'))
                 _send(_build(f'SIP/2.0 200 OK',up_hdrs,body),(PROXY_IP,PROXY_PORT))
                 log.info(f'Fork answered by {dlg.lc_addr[0]} — cancelling other legs')
                 # CANCEL all other pending legs
                 for lid, other in list(fork.legs.items()):
-                    if lid != call_id and other.state == 'trying':
+                    if lid != call_id and other.state in ('trying', 'proceeding'):
                         other.state = 'cancelled'
                         hdrs=[
                             ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={other.lc_branch}'),
                             ('from',fork.up_from),('to',other.lc_to),
                             ('call-id',other.lc_id),('cseq','1 CANCEL'),('max-forwards','70'),
                         ]
-                        _send(_build(f'CANCEL {other.lc_to} SIP/2.0',hdrs),
+                        _send(_build(f'CANCEL {other.lc_target or _uri(other.lc_to)} SIP/2.0',hdrs),
                               other.lc_addr,other.lc_transport,other.lc_conn)
                         with _dlg_lock: _dlg_by_lc.pop(lid,None)
                 # Keep winning leg in fork.legs for BYE routing
@@ -755,45 +972,56 @@ def _on_local_invite_resp(msg,addr,transport='udp',conn=None):
                 # Late 200 from another leg — ACK then BYE to refuse it
                 ack_hdrs=[
                     ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
-                    ('from',dlg.lc_from),('to',dlg.lc_to+f';tag={dlg.lc_tag}'),
+                    ('from',dlg.lc_from),('to',to_resp),
                     ('call-id',dlg.lc_id),('cseq','1 ACK'),('max-forwards','70'),
                 ]
-                _send(_build(f'ACK {dlg.lc_to} SIP/2.0',ack_hdrs),
+                _send(_build(f'ACK {dlg.lc_target or _uri(dlg.lc_to)} SIP/2.0',ack_hdrs),
                       dlg.lc_addr,dlg.lc_transport,dlg.lc_conn)
                 bye_hdrs=[
                     ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
-                    ('from',dlg.lc_from),('to',dlg.lc_to+f';tag={dlg.lc_tag}'),
+                    ('from',dlg.lc_from),('to',to_resp),
                     ('call-id',dlg.lc_id),('cseq','2 BYE'),('max-forwards','70'),
                 ]
-                _send(_build(f'BYE {dlg.lc_to} SIP/2.0',bye_hdrs),
+                _send(_build(f'BYE {dlg.lc_target or _uri(dlg.lc_to)} SIP/2.0',bye_hdrs),
                       dlg.lc_addr,dlg.lc_transport,dlg.lc_conn)
                 with _dlg_lock: _dlg_by_lc.pop(call_id,None)
             return
 
         # ── Error (4xx-6xx) — remove this leg; if all failed, notify upstream ─
         if st>=400:
+            _ack_local_invite_final(dlg, to_resp)
             dlg.state = 'terminated'
             fork.legs.pop(call_id, None)
             with _dlg_lock: _dlg_by_lc.pop(call_id,None)
             if not fork.legs and not fork.answered:
+                if fork.cancelled:
+                    with _forks_lock: _forks.pop(fork.up_id, None)
+                    with _dlg_lock:   _dlg_by_up.pop(fork.up_id, None)
+                    return
                 # All legs rejected — tell IMS nobody answered
-                to_hdr = fork.up_to + f';tag={new_tag()}'
-                _send(_respond(msg, 480, 'Temporarily Unavailable',
-                               extra=[('to', to_hdr)]),
+                if not fork.up_to_tag:
+                    fork.up_to_tag = new_tag()
+                to_hdr = fork.up_to
+                if not _tag(to_hdr):
+                    to_hdr += f';tag={fork.up_to_tag}'
+                up_hdrs=_up_invite_resp_hdrs(fork, to_hdr)
+                _send(_build('SIP/2.0 480 Temporarily Unavailable', up_hdrs),
                       (PROXY_IP, PROXY_PORT))
                 with _forks_lock: _forks.pop(fork.up_id, None)
                 with _dlg_lock:   _dlg_by_up.pop(fork.up_id, None)
+
 
 def _on_upstream_ack(msg):
     call_id=_gh(msg,'call-id')
     with _dlg_lock: dlg=_dlg_by_up.get(call_id)
     if not dlg or dlg.direction!='in': return
+    to_hdr = dlg.lc_peer_to or (dlg.lc_to+f';tag={dlg.lc_tag}')
     hdrs=[
         ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
-        ('from',dlg.lc_from),('to',dlg.lc_to+f';tag={dlg.lc_tag}'),
+        ('from',dlg.lc_from),('to',to_hdr),
         ('call-id',dlg.lc_id),('cseq','1 ACK'),('max-forwards','70'),
     ]
-    _send(_build(f'ACK {dlg.lc_to} SIP/2.0',hdrs),
+    _send(_build(f'ACK {dlg.lc_target or _uri(dlg.lc_to)} SIP/2.0',hdrs),
           dlg.lc_addr,dlg.lc_transport,dlg.lc_conn)
 
 def _on_upstream_bye(msg):
@@ -802,12 +1030,13 @@ def _on_upstream_bye(msg):
     if not dlg: return
     _send(_respond(msg,200,'OK'),(PROXY_IP,PROXY_PORT))
     if dlg.lc_addr:
+        to_hdr = dlg.lc_peer_to or (dlg.lc_to+f';tag={dlg.lc_tag}')
         hdrs=[
             ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
-            ('from',dlg.lc_from),('to',dlg.lc_to+f';tag={dlg.lc_tag}'),
+            ('from',dlg.lc_from),('to',to_hdr),
             ('call-id',dlg.lc_id),('cseq',f'{dlg.lc_cseq+1} BYE'),('max-forwards','70'),
         ]
-        _send(_build(f'BYE {dlg.lc_to} SIP/2.0',hdrs),
+        _send(_build(f'BYE {dlg.lc_target or _uri(dlg.lc_to)} SIP/2.0',hdrs),
               dlg.lc_addr,dlg.lc_transport,dlg.lc_conn)
     _cleanup_dlg(dlg); log.info('Inbound BYE relayed')
 
@@ -829,6 +1058,7 @@ def _dispatch(data, addr, transport='udp', conn=None):
     if addr[0]==PROXY_IP:
         if st and cseq_m=='REGISTER':     _on_register_resp(msg,data)
         elif method=='INVITE':             _on_upstream_invite(msg,data)
+        elif method=='CANCEL':             _on_upstream_cancel(msg,data)
         elif method=='ACK':                _on_upstream_ack(msg)
         elif method=='BYE':                _on_upstream_bye(msg)
         elif method in ('NOTIFY','INFO','MESSAGE','UPDATE','SUBSCRIBE'):
