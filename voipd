@@ -8,7 +8,7 @@
 #
 # Three routing modes available — see ROUTING_MODE below:
 #
-#   b2bua             Signaling-only Back-to-Back User Agent.
+#   b2bua  (default)  Signaling-only Back-to-Back User Agent.
 #                     A Python SIP proxy runs on the router; LAN clients
 #                     register to it with a local SIP account instead of
 #                     registering to the ISP directly.  RTP still flows
@@ -17,7 +17,7 @@
 #                     the B2BUA process's upstream SIP exits via the voip interface.
 #                     Requires VOIP_B2BUA_USER / PASS / DOMAIN to be set.
 #
-#   pbr     (default) Policy-Based Routing.
+#   pbr               Policy-Based Routing.
 #                     Creates a dedicated routing table
 #                     and ip rules so IMS traffic always exits via voip,
 #                     regardless of UniFiOS default WAN priority.
