@@ -28,7 +28,9 @@ REG_EXPIRES = int(_e('B2BUA_REG_EXPIRES','600'))
 STATE_DIR   = _e('B2BUA_STATE_DIR',    '/var/run/voipd')
 
 # ── Sockets ────────────────────────────────────────────────────────────────────
-_udp_sock  = None   # single UDP socket: 0.0.0.0:LOCAL_PORT
+_udp_lan   = None   # LAN UDP socket: 0.0.0.0:LOCAL_PORT
+_udp_wan   = None   # WAN UDP socket: VOIP_IP:LOCAL_PORT
+_lan_ips   = set()  # Dynamically tracked LAN IPs
 _tcp_srv   = None   # TCP listener socket
 _tcp_conns = {}     # {(ip,port): socket}  — active TCP client connections
 _tcp_lock  = threading.Lock()
@@ -153,8 +155,23 @@ def _preferred_identity(uris):
 def _local_user(default=''):
     return LOCAL_USER or default or SIP_USER
 
-def _local_contact(default=''):
-    return f'<sip:{_local_user(default)}@{VOIP_IP}:{LOCAL_PORT}>'
+_cached_lan_ip = {}
+def _get_lan_ip(target_ip=None):
+    if not target_ip: return VOIP_IP
+    if target_ip in _cached_lan_ip: return _cached_lan_ip[target_ip]
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect((target_ip, 53))
+        ip = s.getsockname()[0]
+    except Exception:
+        ip = VOIP_IP
+    finally:
+        s.close()
+    _cached_lan_ip[target_ip] = ip
+    return ip
+
+def _local_contact(default='', target_ip=None):
+    return f'<sip:{_local_user(default)}@{_get_lan_ip(target_ip)}:{LOCAL_PORT}>'
 
 def _up_invite_resp_hdrs(dlg, to_hdr):
     via_hdrs=[('via', v) for v in (getattr(dlg, 'up_vias', []) or [])]
@@ -252,7 +269,11 @@ def _send(raw, addr, transport='udp', conn=None):
         try:    conn.sendall(raw)
         except Exception as exc: log.error(f'tcp send {addr}: {exc}')
     else:
-        try:    _udp_sock.sendto(raw, addr)
+        try:
+            if addr[0] == PROXY_IP or addr[0] not in _lan_ips:
+                _udp_wan.sendto(raw, addr)
+            else:
+                _udp_lan.sendto(raw, addr)
         except Exception as exc: log.error(f'udp send {addr}: {exc}')
 
 # ── TCP: message framing + server ─────────────────────────────────────────────
@@ -535,7 +556,7 @@ def _on_local_register(msg,addr,transport='udp',conn=None):
     if not _tag(to_val): to_val+=f';tag={new_tag()}'
     _send(_respond(msg,200,'OK',extra=[
         ('to',to_val),
-        ('contact',_local_contact(local_username)),
+        ('contact',_local_contact(local_username, addr[0])),
         ('expires',str(expires)),
     ],addr=addr),addr,transport,conn)
     _write_state()
@@ -714,7 +735,7 @@ def _on_upstream_invite_resp(msg,raw=b''):
         lc_hdrs=via_hdrs+[
             ('from',dlg.lc_from),('to',to_hdr),('call-id',dlg.lc_id),
             ('cseq',f'{dlg.lc_cseq} INVITE'),
-            ('contact',_local_contact(_user_from_uri(_uri(dlg.lc_from)))),
+            ('contact',_local_contact(_user_from_uri(_uri(dlg.lc_from)), dlg.lc_addr[0])),
         ]
         for hdr_name in ('warning', 'reason'):
             hdr_val = _gh(msg, hdr_name)
@@ -781,7 +802,7 @@ def _on_local_cancel(msg,addr,transport='udp',conn=None):
 
 def _ack_local_invite_final(dlg, to_hdr):
     hdrs=[
-        ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
+        ('via',     f'SIP/2.0/UDP {_get_lan_ip(dlg.lc_addr[0])}:{LOCAL_PORT};branch={new_branch()}'),
         ('from',dlg.lc_from),('to',to_hdr),
         ('call-id',dlg.lc_id),('cseq','1 ACK'),('max-forwards','70'),
     ]
@@ -819,7 +840,7 @@ def _on_upstream_cancel(msg,raw=b''):
             if dlg.state in ('trying','proceeding'):
                 dlg.state='cancelled'
                 hdrs=[
-                    ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={dlg.lc_branch}'),
+                    ('via',     f'SIP/2.0/UDP {_get_lan_ip(dlg.lc_addr[0])}:{LOCAL_PORT};branch={dlg.lc_branch}'),
                     ('from',fork.up_from),('to',dlg.lc_to),
                     ('call-id',dlg.lc_id),('cseq','1 CANCEL'),('max-forwards','70'),
                 ]
@@ -863,10 +884,10 @@ def _on_upstream_invite(msg,raw=b''):
         with _dlg_lock:
             _dlg_by_lc[dlg.lc_id] = dlg
         lc_hdrs=[
-            ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={dlg.lc_branch};rport'),
+            ('via',     f'SIP/2.0/UDP {_get_lan_ip(reg.addr[0])}:{LOCAL_PORT};branch={dlg.lc_branch};rport'),
             ('from',    from_val), ('to', dlg.lc_to), ('call-id', dlg.lc_id),
             ('cseq',    '1 INVITE'),
-            ('contact', _local_contact(reg.username)),
+            ('contact', _local_contact(reg.username, reg.addr[0])),
             ('max-forwards','70'),
         ]
         if body: lc_hdrs.append(('content-type','application/sdp'))
@@ -1109,7 +1130,7 @@ def _write_state():
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 def main():
-    global _udp_sock, _tcp_srv
+    global _udp_lan, _udp_wan, _tcp_srv
     missing=[k for k,v in [('B2BUA_PROXY',PROXY_IP),('B2BUA_DOMAIN',SIP_DOMAIN),
                              ('B2BUA_USER',SIP_USER),('B2BUA_PASS',SIP_PASS),
                              ('B2BUA_VOIP_IP',VOIP_IP)] if not v]
@@ -1122,19 +1143,26 @@ def main():
     log.info(f'  Inbound: parallel fork to all registered clients')
     if LOCAL_PASS: log.info('  Auth   : local client password required')
 
-    _udp_sock=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-    _udp_sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-    try: _udp_sock.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)
+    _udp_lan=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    _udp_lan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    try: _udp_lan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)
     except (AttributeError,OSError): pass
-    # Mark all outgoing UDP packets with the voip fwmark so the kernel routes
-    # them via the voip routing table (ip rule fwmark 0x1e0000 lookup voip).
-    # This is required because the socket is bound to 0.0.0.0 — without an
-    # explicit source IP the kernel would otherwise route upstream SIP via the
-    # default WAN (ppp0) instead of the voip VLAN interface.
-    try: _udp_sock.setsockopt(socket.SOL_SOCKET,socket.SO_MARK,0x1e0000)
-    except (AttributeError,OSError) as e: import logging; logging.getLogger('voipd.b2bua').warning(f'SO_MARK unavailable: {e}')
+    _udp_lan.bind(('0.0.0.0',LOCAL_PORT))
+
+    _udp_wan=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+    _udp_wan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+    try: _udp_wan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)
     except (AttributeError,OSError): pass
-    _udp_sock.bind(('0.0.0.0',LOCAL_PORT))
+    _udp_wan.bind((VOIP_IP,LOCAL_PORT))
+
+    def _lan_worker():
+        while True:
+            try:
+                data,addr=_udp_lan.recvfrom(65535)
+                _lan_ips.add(addr[0])
+                threading.Thread(target=_dispatch,args=(data,addr,'udp',None),daemon=True).start()
+            except Exception as exc: log.debug(f'lan udp recv:{exc}')
+    threading.Thread(target=_lan_worker,daemon=True,name='udp-lan').start()
 
     threading.Thread(target=_tcp_server_loop,daemon=True,name='tcp-srv').start()
 
@@ -1152,10 +1180,12 @@ def main():
 
     while True:
         try:
-            data,addr=_udp_sock.recvfrom(65535)
+            data,addr=_udp_wan.recvfrom(65535)
             threading.Thread(target=_dispatch,args=(data,addr,'udp',None),daemon=True).start()
-        except OSError: break
-        except Exception as exc: log.debug(f'udp recv:{exc}')
+        except OSError as exc:
+            if getattr(exc, 'errno', 0) == 9: break
+            log.debug(f'wan udp OSError: {exc}')
+        except Exception as exc: log.debug(f'wan udp recv:{exc}')
 
 if __name__=='__main__':
     main()
