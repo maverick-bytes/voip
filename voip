@@ -75,12 +75,8 @@ install_service() {
     chmod +x /usr/local/bin/${DAEMON_SCRIPT}
     echo "  Daemon installed to /usr/local/bin/${DAEMON_SCRIPT}"
 
-    # Install B2BUA script (required for b2bua routing mode)
-    if [ -f "${SCRIPT_DIR}/b2bua.py" ]; then
-        cp "${SCRIPT_DIR}/b2bua.py" /data/voip/b2bua.py
-        chmod +x /data/voip/b2bua.py
-        echo "  B2BUA script installed to /data/voip/b2bua.py"
-    fi
+    chmod +x /data/voip/b2bua.py
+    echo "  B2BUA script installed"
 
     cp "${SCRIPT_DIR}/${SERVICE_FILE}" /lib/systemd/system/
     echo "  Service file installed to /lib/systemd/system/${SERVICE_FILE}"
