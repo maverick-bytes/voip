@@ -71,9 +71,8 @@ install_service() {
     [ ! -f "${SCRIPT_DIR}/${DAEMON_SCRIPT}" ] && echo "Error: ${DAEMON_SCRIPT} not found" >&2 && exit 1
     [ ! -f "${SCRIPT_DIR}/${SERVICE_FILE}" ]  && echo "Error: ${SERVICE_FILE} not found"  >&2 && exit 1
 
-    cp "${SCRIPT_DIR}/${DAEMON_SCRIPT}" /usr/local/bin/
-    chmod +x /usr/local/bin/${DAEMON_SCRIPT}
-    echo "  Daemon installed to /usr/local/bin/${DAEMON_SCRIPT}"
+    chmod +x "${SCRIPT_DIR}/${DAEMON_SCRIPT}"
+    echo "  Daemon ready at ${SCRIPT_DIR}/${DAEMON_SCRIPT}"
 
     chmod +x /data/voip/b2bua.py
     echo "  B2BUA script installed"
@@ -96,7 +95,11 @@ install_service() {
 
 uninstall_service() {
     echo "Uninstalling VoIP daemon..."
-    systemctl stop    ${SERVICE_NAME} 2>/dev/null || true
+    # Use timeout so a stuck voipd stop never hangs the uninstaller.
+    # If graceful stop takes >15s, systemd's KillMode=mixed will kill all
+    # subprocesses; we force-kill the main process here for safety.
+    timeout 15 systemctl stop "${SERVICE_NAME}" 2>/dev/null || \
+        { pkill -9 -f "voipd start" 2>/dev/null || true; sleep 1; }
     systemctl disable ${SERVICE_NAME} 2>/dev/null || true
     rm -f /lib/systemd/system/${SERVICE_FILE}
     rm -f /usr/local/bin/${DAEMON_SCRIPT}
@@ -119,14 +122,17 @@ update_service() {
     fi
     mv voip-main voip-update-tmp
 
-    # --- Daemon: only reinstall if voipd or b2bua.py actually changed --------
-    local _voipd_changed=false _b2bua_changed=false
-    if ! cmp -s voip-update-tmp/voipd /usr/local/bin/voipd 2>/dev/null; then
+    # --- Daemon: only reinstall if voipd, b2bua.py, or the service unit changed
+    local _voipd_changed=false _b2bua_changed=false _service_changed=false
+    if ! cmp -s voip-update-tmp/voipd /data/voip/voipd 2>/dev/null; then
         _voipd_changed=true
     fi
     if [ -f voip-update-tmp/b2bua.py ] && \
        ! cmp -s voip-update-tmp/b2bua.py /data/voip/b2bua.py 2>/dev/null; then
         _b2bua_changed=true
+    fi
+    if ! cmp -s voip-update-tmp/voipd.service /data/voip/voipd.service 2>/dev/null; then
+        _service_changed=true
     fi
 
     cp voip-update-tmp/voipd         /data/voip/voipd
@@ -140,8 +146,7 @@ update_service() {
         cp voip-update-tmp/voipd.conf.example /data/voip/voipd.conf.example
     chmod +x /data/voip/voipd /data/voip/voip /data/voip/uninstall.sh
 
-    if [ "$_voipd_changed" = "true" ] || [ "$_b2bua_changed" = "true" ]; then
-        cp /data/voip/voipd /usr/local/bin/voipd
+    if [ "$_voipd_changed" = "true" ] || [ "$_b2bua_changed" = "true" ] || [ "$_service_changed" = "true" ]; then
         cp /data/voip/voipd.service /lib/systemd/system/voipd.service
         systemctl daemon-reload
         systemctl restart voipd
@@ -149,8 +154,10 @@ update_service() {
             echo "  voipd and b2bua.py updated — service restarted."
         elif [ "$_voipd_changed" = "true" ]; then
             echo "  voipd updated — service restarted."
-        else
+        elif [ "$_b2bua_changed" = "true" ]; then
             echo "  b2bua.py updated — service restarted."
+        else
+            echo "  voipd.service updated — service restarted."
         fi
     else
         echo "  voipd unchanged — skipping reinstall."
@@ -379,11 +386,22 @@ _nginx_install() {
     cat > "${NGINX_LOC_CONF}" << LOCEOF
 # VoIP Control Panel — managed by ./voip install-ui
 
-# API routes: secured by nginx-injected internal token (see voip script).
-# The token is written to /data/voip/ui/.internal-token at install time.
-# proxy_set_header overwrites any client-supplied X-Voip-Token header so
-# this cannot be forged from outside, even via VPN/Teleport.
+# API routes: authentication uses the SAME include chain as every other
+# authenticated API location on this controller (e.g. /proxy/network/),
+# instead of a hand-rolled auth_request. This matters: auth.conf forwards
+# X-Expected-Csrf-Token / X-Provided-Csrf-Token to the upstream for the
+# application to check itself, rather than rejecting in nginx -- a
+# hand-rolled auth_request without cors.conf/security.conf ahead of it was
+# observed to make UniFi OS's internal validator reject authenticated POST
+# requests outright (403, never reaching this backend). No error_page for
+# 401 here on purpose: this is a JSON API, not a page render, so callers
+# should see a clean status code rather than being redirected into an HTML
+# login page (which breaks JSON parsing on the frontend). The X-Voip-Token
+# header remains as defense-in-depth alongside auth.conf's session check.
 location /voip/api/ {
+    include /usr/share/unifi-core/http/cors.conf;
+    include /usr/share/unifi-core/http/security.conf;
+    include /usr/share/unifi-core/http/auth.conf;
     proxy_pass http://127.0.0.1:8099;
     proxy_http_version 1.1;
     proxy_set_header Host \$host;
@@ -392,9 +410,13 @@ location /voip/api/ {
     proxy_read_timeout 120s;
 }
 
-# UI entry point: gated by UniFi OS session.
+# UI entry point: gated by UniFi OS session. Redirecting unauthenticated
+# page loads to the login page (rather than returning a bare 401) is the
+# correct behavior here since this serves HTML, not JSON.
 location /voip {
-    auth_request /internal/auth/public-api;
+    include /usr/share/unifi-core/http/cors.conf;
+    include /usr/share/unifi-core/http/security.conf;
+    include /usr/share/unifi-core/http/auth.conf;
     error_page 401 = @voip_unauth;
     proxy_pass http://127.0.0.1:8099;
     proxy_http_version 1.1;

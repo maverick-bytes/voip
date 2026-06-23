@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-voipd-b2bua v1.4 — UDP + TCP SIP B2BUA for UniFiOS voipd
+voipd-b2bua v1.5 — UDP + TCP SIP B2BUA for UniFiOS voipd
 Single registrar for LAN clients (both UDP and TCP transport).
 Parallel forking on inbound calls — all registered clients ring simultaneously.
 Upstream toward IMS always uses UDP.
-Kernel PBR routes upstream traffic via the voip VLAN interface.
+Supports two socket modes: dual-socket (non-netns, direct routing) and
+single-socket (netns, all traffic via veth through FORWARD chain (ALIEN/TOR + IPS) and IPS/DPI).
 """
 import os, sys, re, time, socket, threading, hashlib, random, logging, signal
 
@@ -26,14 +27,17 @@ LOCAL_PASS  = _e('B2BUA_LOCAL_PASS',   '')
 LOCAL_USER  = _e('B2BUA_LOCAL_USER',   '')
 REG_EXPIRES = int(_e('B2BUA_REG_EXPIRES','600'))
 STATE_DIR   = _e('B2BUA_STATE_DIR',    '/var/run/voipd')
+WAN_IFACE   = _e('B2BUA_WAN_IFACE',    '')
+NETNS_MODE  = _e('B2BUA_NETNS',        'false').lower() == 'true'
+LAN_IP      = _e('B2BUA_LAN_IP',       '')  # Router LAN IP, reachable from all LAN clients
 
 # ── Sockets ────────────────────────────────────────────────────────────────────
-_udp_lan   = None   # LAN UDP socket: 0.0.0.0:LOCAL_PORT
-_udp_wan   = None   # WAN UDP socket: VOIP_IP:LOCAL_PORT
-_lan_ips   = set()  # Dynamically tracked LAN IPs
+_udp_lan   = None   # UDP socket for LAN clients (0.0.0.0:5060)
+_udp_wan   = None   # UDP socket for IMS upstream (VOIP_IP:5060)
 _tcp_srv   = None   # TCP listener socket
 _tcp_conns = {}     # {(ip,port): socket}  — active TCP client connections
 _tcp_lock  = threading.Lock()
+_added_routes = set() # Dynamically tracked RTP media IPs
 
 # Event set right before the main UDP recv loop starts
 _loop_ready = threading.Event()
@@ -159,14 +163,22 @@ _cached_lan_ip = {}
 def _get_lan_ip(target_ip=None):
     if not target_ip: return VOIP_IP
     if target_ip in _cached_lan_ip: return _cached_lan_ip[target_ip]
-    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        s.connect((target_ip, 53))
-        ip = s.getsockname()[0]
-    except Exception:
-        ip = VOIP_IP
-    finally:
-        s.close()
+    if NETNS_MODE and LAN_IP:
+        # Inside the netns the only IP is 172.31.255.2. Returning that in Via/
+        # Contact headers breaks UDP LAN clients — they try to send responses
+        # to 172.31.255.2 which is unreachable from LAN subnets.
+        # Use the router's LAN IP (B2BUA_LAN_IP) instead: it is reachable from
+        # all LAN subnets and the DNAT rule redirects it back to 172.31.255.2.
+        ip = LAN_IP
+    else:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect((target_ip, 53))
+            ip = s.getsockname()[0]
+        except Exception:
+            ip = VOIP_IP
+        finally:
+            s.close()
     _cached_lan_ip[target_ip] = ip
     return ip
 
@@ -263,13 +275,32 @@ def _respond(req,status,reason,extra=None,body=b'',addr=None):
     if body:  hdrs.append(('content-type','application/sdp'))
     return _build(fl,hdrs,body)
 
+# Track known LAN IPs for socket routing decision
+_lan_ips = set()
+
 def _send(raw, addr, transport='udp', conn=None):
-    """Send raw SIP bytes. Uses TCP conn if provided, else UDP."""
+    """Send raw SIP bytes. Uses TCP conn if provided, else UDP.
+    
+    Two sockets:
+    - _udp_lan: bound to 0.0.0.0 for LAN clients
+    - _udp_wan: bound to VOIP_IP for IMS upstream
+    
+    LAN client traffic uses _udp_lan, IMS traffic uses _udp_wan.
+    """
     if transport == 'tcp' and conn:
         try:    conn.sendall(raw)
-        except Exception as exc: log.error(f'tcp send {addr}: {exc}')
+        except Exception as exc:
+            log.error(f'tcp send {addr}: {exc}')
+            # Dead TCP conn — evict all registrations tied to it immediately
+            with _regs_lock:
+                dead = [a for a,r in _regs.items()
+                        if r.transport=='tcp' and r.conn is conn]
+                for a in dead: _regs.pop(a, None)
+            if dead:
+                log.info(f'tcp send fail: evicted {len(dead)} reg(s) for {addr[0]}:{addr[1]}')
     else:
         try:
+            # Route to IMS (upstream) via _udp_wan; LAN clients via _udp_lan
             if addr[0] == PROXY_IP or addr[0] not in _lan_ips:
                 _udp_wan.sendto(raw, addr)
             else:
@@ -313,6 +344,14 @@ def _tcp_client_loop(conn, addr):
             if not chunk:
                 break
             buf += chunk
+            # RFC 5626 keepalive: client sends \r\n\r\n (double-CRLF ping),
+            # server must respond with \r\n (single-CRLF pong).
+            # Without this, clients with short TCP timers close the connection
+            # every ~30s causing a reconnect gap where inbound calls are missed.
+            while buf.startswith(b'\r\n'):
+                try:    conn.sendall(b'\r\n')
+                except: pass
+                buf = buf[2:]
             while True:
                 raw, buf = _extract_sip_msg(buf)
                 if raw is None:
@@ -327,7 +366,14 @@ def _tcp_client_loop(conn, addr):
             _tcp_conns.pop(addr, None)
         try:    conn.close()
         except: pass
-        log.debug(f'TCP disconnected: {addr[0]}:{addr[1]}')
+        # Null the conn on TCP disconnect — keeps the reg alive so the next
+        # inbound fork can attempt a fresh reconnect to the client's contact
+        # port, rather than evicting the reg and missing the call entirely.
+        with _regs_lock:
+            for _r in _regs.values():
+                if _r.transport == 'tcp' and _r.addr == addr:
+                    _r.conn = None
+        log.debug(f'TCP disconnected (conn nulled): {addr[0]}:{addr[1]}')
 
 def _tcp_server_loop():
     global _tcp_srv
@@ -469,6 +515,7 @@ def _on_register_resp(msg,raw=b''):
     with _ureg_lock:
         if st==200:
             _ureg['registered']=True
+            _ureg['invite_nc']=2   # fresh registration = fresh nonce window
             sr=[v for n,v in msg.get('headers',[]) if n=='service-route']
             _ureg['service_route']=sr
             assoc=[]
@@ -588,6 +635,16 @@ def _on_local_invite(msg,addr,transport='udp',conn=None):
     dlg.lc_to=to_val; dlg.lc_tag=new_tag(); dlg.lc_cseq=_cseq_num(cseq_val)
     dlg.lc_vias=[v for n,v in msg.get('headers',[]) if n=='via']
     dlg.lc_transport=transport; dlg.lc_conn=conn
+    # Extract Contact from LAN client's INVITE → use as lc_target and fix
+    # lc_addr port. The source port in addr is ephemeral; Contact has the
+    # real SIP listening port we must use when sending BYE/CANCEL back.
+    _lc_contact_val = _gh(msg,'contact')
+    if _lc_contact_val:
+        _lc_contact_uri = _uri(_lc_contact_val)
+        dlg.lc_target = _lc_contact_uri
+        _m = re.search(r'@([^;>:]+):(\d+)', _lc_contact_uri)
+        if _m:
+            dlg.lc_addr = (addr[0], int(_m.group(2)))
     dlg.lc_body=body  # stored for potential auth retry
     dlg.up_id=new_call_id(); dlg.up_branch=new_branch()
     dlg.up_identity=''
@@ -619,6 +676,15 @@ def _on_local_invite(msg,addr,transport='udp',conn=None):
         # conflicts with INVITE nc=2,3,4... invite_nc resets to 2 on new nonce.
         if _ureg.get('challenge'):
             nc = _ureg.get('invite_nc', 2)
+            # If nc is getting high the nonce window is nearly exhausted.
+            # Trigger an immediate REGISTER (without auth) so IMS issues a
+            # new nonce. This is a safety net; normal flow resets nc on
+            # every 401-to-REGISTER and every 407-to-INVITE.
+            if nc > 8:
+                log.warning(f'invite_nc={nc} too high — forcing REGISTER to refresh nonce')
+                _ureg['invite_nc'] = 2
+                threading.Thread(target=_send_register, args=(False,), daemon=True).start()
+                nc = 2
             _ureg['invite_nc'] = nc + 1
             h = _build_auth('INVITE', up_req_uri, SIP_USER, SIP_PASS,
                             _ureg['challenge'], 'Proxy-Authorization', nc_val=nc)
@@ -656,6 +722,11 @@ def _on_upstream_invite_resp(msg,raw=b''):
                 ]
                 _send(_build(f'ACK {_uri(dlg.up_to)} SIP/2.0', ack_hdrs), (PROXY_IP, PROXY_PORT))
                 auth_key = 'authorization' if st == 401 else 'proxy-authorization'
+                # 407/401 gives us a fresh nonce — reset invite_nc so the
+                # next pre-auth INVITE starts at nc=2, not wherever it was.
+                with _ureg_lock:
+                    _ureg['challenge'] = chal
+                    _ureg['invite_nc'] = 2
                 h = _build_auth('INVITE', _uri(dlg.up_to), SIP_USER, SIP_PASS, chal,
                                 'Authorization' if st == 401 else 'Proxy-Authorization',
                                 nc_val=1)
@@ -741,7 +812,10 @@ def _on_upstream_invite_resp(msg,raw=b''):
             hdr_val = _gh(msg, hdr_name)
             if hdr_val:
                 lc_hdrs.append((hdr_name, hdr_val))
-        if body: lc_hdrs.append(('content-type','application/sdp'))
+        if body:
+            lc_hdrs.append(('content-type','application/sdp'))
+            # RTP routing is handled by the IMS subnet route in the main table
+            # added by voipd at startup — no per-call /32 routes needed.
         _send(_build(f'SIP/2.0 {local_st} {local_reason}',lc_hdrs,body),
               dlg.lc_addr,dlg.lc_transport,dlg.lc_conn)
         log.info(f'-> {local_st} {local_reason} to {dlg.lc_addr[0]}')
@@ -891,9 +965,54 @@ def _on_upstream_invite(msg,raw=b''):
             ('max-forwards','70'),
         ]
         if body: lc_hdrs.append(('content-type','application/sdp'))
+        # If TCP conn is None (disconnected), try to re-establish to client.
+        # Use source IP (reg.addr[0]) + contact port — NOT the contact host
+        # which may be an unreachable interface (e.g. Windows hotspot IP).
+        _eff_transport = reg.transport
+        _eff_conn      = reg.conn
+        _eff_addr      = reg.addr
+        if reg.transport == 'tcp' and reg.conn is None:
+            _cport = None
+            if reg.contact:
+                _m = re.search(r':(\d+)[;>]?', _uri(reg.contact))
+                if _m: _cport = int(_m.group(1))
+            _cport = _cport or 5060
+            try:
+                _nc = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                _nc.settimeout(1.5)
+                _nc.connect((reg.addr[0], _cport))
+                _nc.settimeout(None)
+                with _regs_lock:
+                    for _r in _regs.values():
+                        if _r.transport=='tcp' and _r.addr==reg.addr:
+                            _r.conn = _nc
+                with _tcp_lock:
+                    _tcp_conns[reg.addr] = _nc
+                _eff_conn = _nc
+                _eff_addr = (reg.addr[0], _cport)
+                dlg.lc_conn = _nc
+                dlg.lc_addr = _eff_addr
+                log.info(f'  TCP reconnected to {reg.addr[0]}:{_cport}')
+                threading.Thread(target=_tcp_client_loop,
+                                 args=(_nc, _eff_addr), daemon=True).start()
+            except Exception as _e:
+                log.info(f'  TCP reconnect {reg.addr[0]}:{_cport} failed ({_e}) — skipping leg')
+                # Do NOT fall back to UDP: reg.addr[1] is an ephemeral TCP
+                # source port, not a UDP listener. The device is reachable
+                # via its own UDP registration entry if it has one.
+                fork.legs.pop(dlg.lc_id, None)
+                with _dlg_lock: _dlg_by_lc.pop(dlg.lc_id, None)
+                continue
         _send(_build(f'INVITE {dlg.lc_target} SIP/2.0',lc_hdrs,body),
-              reg.addr,reg.transport,reg.conn)
-        log.info(f'  -> fork leg {dlg.lc_id[:8]} to {reg.addr[0]}:{reg.addr[1]} ({reg.transport.upper()})')
+              _eff_addr, _eff_transport, _eff_conn)
+        with _regs_lock:
+            still_live = aor in _regs
+        if not still_live and _eff_transport == 'tcp':
+            fork.legs.pop(dlg.lc_id, None)
+            with _dlg_lock: _dlg_by_lc.pop(dlg.lc_id, None)
+            log.info(f'  -> fork leg {dlg.lc_id[:8]} FAILED (TCP dead) — removed')
+        else:
+            log.info(f'  -> fork leg {dlg.lc_id[:8]} to {_eff_addr[0]}:{_eff_addr[1]} ({_eff_transport.upper()})')
 
 def _on_local_invite_resp(msg,addr,transport='udp',conn=None):
     st=_status(msg); call_id=_gh(msg,'call-id'); body=msg.get('body',b'')
@@ -1051,13 +1170,27 @@ def _on_upstream_bye(msg):
     if not dlg: return
     _send(_respond(msg,200,'OK'),(PROXY_IP,PROXY_PORT))
     if dlg.lc_addr:
-        to_hdr = dlg.lc_peer_to or (dlg.lc_to+f';tag={dlg.lc_tag}')
+        # For outbound calls (direction='out'), b2bua is the UAS (called side).
+        # From/To in the BYE must be from the called-side perspective:
+        #   From = called party (lc_to + b2bua tag)
+        #   To   = calling party (lc_from, already includes caller tag)
+        # For inbound calls (direction='in'), b2bua acts as caller proxy:
+        #   From = IMS caller (lc_from, already includes IMS tag)
+        #   To   = local client with its tag (lc_peer_to)
+        if dlg.direction == 'out':
+            _lc_to_tag = dlg.lc_to if ';tag=' in dlg.lc_to else dlg.lc_to+f';tag={dlg.lc_tag}'
+            bye_from = _lc_to_tag
+            bye_to   = dlg.lc_from
+        else:
+            bye_from = dlg.lc_from
+            bye_to   = dlg.lc_peer_to or (dlg.lc_to+f';tag={dlg.lc_tag}')
         hdrs=[
-            ('via',     f'SIP/2.0/UDP {VOIP_IP}:{LOCAL_PORT};branch={new_branch()}'),
-            ('from',dlg.lc_from),('to',to_hdr),
+            ('via',     f'SIP/2.0/UDP {_get_lan_ip(dlg.lc_addr[0])}:{LOCAL_PORT};branch={new_branch()}'),
+            ('from',bye_from),('to',bye_to),
             ('call-id',dlg.lc_id),('cseq',f'{dlg.lc_cseq+1} BYE'),('max-forwards','70'),
         ]
-        _send(_build(f'BYE {dlg.lc_target or _uri(dlg.lc_to)} SIP/2.0',hdrs),
+        _bye_uri = dlg.lc_target or f'sip:{_user_from_uri(_uri(bye_to))}@{dlg.lc_addr[0]}:{dlg.lc_addr[1]}'
+        _send(_build(f'BYE {_bye_uri} SIP/2.0',hdrs),
               dlg.lc_addr,dlg.lc_transport,dlg.lc_conn)
     _cleanup_dlg(dlg); log.info('Inbound BYE relayed')
 
@@ -1138,28 +1271,44 @@ def main():
         log.error(f'Missing env vars: {", ".join(missing)}'); sys.exit(1)
 
     log.info('voipd-b2bua v1.4 starting (UDP + TCP)')
-    log.info(f'  Local  : 0.0.0.0:{LOCAL_PORT}  (LAN clients, UDP + TCP)')
+    log.info(f'  LAN    : 0.0.0.0:{LOCAL_PORT}  (LAN clients)')
+    log.info(f'  WAN    : {VOIP_IP}:{LOCAL_PORT} (IMS upstream)')
     log.info(f'  IMS    : {SIP_USER}@{SIP_DOMAIN} via {PROXY_IP}:{PROXY_PORT} (UDP)')
     log.info(f'  Inbound: parallel fork to all registered clients')
     if LOCAL_PASS: log.info('  Auth   : local client password required')
 
-    _udp_lan=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-    _udp_lan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-    try: _udp_lan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)
-    except (AttributeError,OSError): pass
-    _udp_lan.bind(('0.0.0.0',LOCAL_PORT))
+    # Socket architecture depends on mode:
+    # - NetNS mode: single socket bound to 0.0.0.0 (all traffic via veth, goes through FORWARD chain)
+    # - Non-NetNS mode: dual sockets - _udp_lan for LAN clients, _udp_wan for IMS upstream
+    if NETNS_MODE:
+        # Single socket for netns - all traffic flows via veth, visible to IPS/DPI/FORWARD chain (ALIEN/TOR + IPS)
+        _udp=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        _udp.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+        try: _udp.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)
+        except (AttributeError,OSError): pass
+        _udp.bind(('0.0.0.0',LOCAL_PORT))
+        _udp_lan = _udp  # For routing logic compatibility
+        _udp_wan = _udp  # For routing logic compatibility
+    else:
+        # Dual sockets for non-netns mode
+        _udp_lan=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        _udp_lan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+        try: _udp_lan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)
+        except (AttributeError,OSError): pass
+        _udp_lan.bind(('0.0.0.0',LOCAL_PORT))
 
-    _udp_wan=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
-    _udp_wan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
-    try: _udp_wan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)
-    except (AttributeError,OSError): pass
-    _udp_wan.bind((VOIP_IP,LOCAL_PORT))
+        _udp_wan=socket.socket(socket.AF_INET,socket.SOCK_DGRAM)
+        _udp_wan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1)
+        try: _udp_wan.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEPORT,1)
+        except (AttributeError,OSError): pass
+        _udp_wan.bind((VOIP_IP,LOCAL_PORT))
 
     def _lan_worker():
+        """Receive UDP from LAN clients and dispatch each message in a thread."""
         while True:
             try:
                 data,addr=_udp_lan.recvfrom(65535)
-                _lan_ips.add(addr[0])
+                _lan_ips.add(addr[0])  # Track for _send routing decision
                 threading.Thread(target=_dispatch,args=(data,addr,'udp',None),daemon=True).start()
             except Exception as exc: log.debug(f'lan udp recv:{exc}')
     threading.Thread(target=_lan_worker,daemon=True,name='udp-lan').start()
@@ -1178,6 +1327,7 @@ def main():
     log.info('B2BUA ready')
     _loop_ready.set()
 
+    # WAN UDP receive loop - receives IMS responses
     while True:
         try:
             data,addr=_udp_wan.recvfrom(65535)

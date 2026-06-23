@@ -1,4 +1,4 @@
-# VoIP on UniFiOS
+# VoIP on UniFi OS
 
 These scripts allow you to configure VoIP service for customers who have replaced their ISP router with a Unifi gateway based on UnifiOS (Cloud Gateways (UCG-XX), Gateways (UXG-XX), Dream routers (UDM-XX), etc...).
 
@@ -49,8 +49,9 @@ A full example configuration with all available options is available in `voipd.c
 
 | Mode | Description |
 |------|-------------|
-| `b2bua` | **Default (recommended).** A signaling-only SIP Back-to-Back User Agent runs on the gateway. LAN clients register to the gateway with a local SIP account instead of directly to the ISP's IMS network. RTP flows peer-to-peer — no media is relayed and no latency is added. |
-| `pbr` | Policy-Based Routing. Creates a dedicated routing table (table 203) and ip rules so IMS traffic always exits via the voip interface, regardless of UniFiOS default WAN priority. LAN clients register directly to the ISP's SIP proxy. |
+| `b2bua_netns` | **Default (recommended).** A sandboxed SIP Back-to-Back User Agent running inside a Linux network namespace, connected to the router via a veth pair. All SIP traffic traverses the UniFiOS ALIEN/TOR threat intelligence blocking and IPS (via the FORWARD chain), and security inspection chains before reaching the IMS network. Requires `VOIP_B2BUA_USER`, `VOIP_B2BUA_PASS`, `VOIP_B2BUA_DOMAIN`, and `PCSCF_HOSTNAME` to be set. |
+| `b2bua` | **(Deprecated.)** Non-sandboxed SIP Back-to-Back User Agent running directly on the router. Upstream SIP/RTP is router-originated (OUTPUT chain) so ALIEN/TOR blocking and IPS do not apply. `PCSCF_HOSTNAME` is not required. Kept for compatibility — use `b2bua_netns` for new deployments. |
+| `pbr` | Policy-Based Routing. Creates a dedicated routing table and ip rules so IMS traffic always exits via the voip interface, regardless of UniFiOS default WAN priority. LAN clients register directly to the ISP's SIP proxy. |
 | `forward` | Routes IMS traffic through one or more existing VLAN interfaces (`VOIP_FORWARD_INTERFACE`). Use if you want to steer traffic through a different port or pre-existing VLAN. |
 
 ### Configuration guide
@@ -65,7 +66,27 @@ A full example configuration with all available options is available in `voipd.c
 
 * `PCSCF_HOSTNAME`: Your ISP's SIP proxy hostname — resolved at startup using DNS from the VoIP DHCP lease
 
-**B2BUA mode settings** (`ROUTING_MODE="b2bua"`)
+**B2BUA NETNS mode settings** (`ROUTING_MODE="b2bua_netns"`) *(recommended)*
+
+> **Note:** `b2bua_netns` requires a valid `PCSCF_HOSTNAME` so the daemon can resolve the P-CSCF address and route SIP inside the network namespace. Make sure this is set correctly before starting the service.
+
+* `PCSCF_HOSTNAME`: Your ISP's P-CSCF hostname — resolved at startup using DNS from the VoIP DHCP lease. **Required** in this mode.
+
+* `VOIP_B2BUA_USER` / `VOIP_B2BUA_PASS` / `VOIP_B2BUA_DOMAIN`: ISP SIP credentials the B2BUA uses to register upstream to the IMS network
+
+* `VOIP_B2BUA_LISTEN_PORT`: Local SIP port (UDP + TCP) that LAN clients register to — default `5060`
+
+* `VOIP_B2BUA_LOCAL_USER` / `VOIP_B2BUA_LOCAL_PASS`: Optional credentials to require from LAN clients when registering. Leave empty to allow any LAN client without authentication.
+
+* `VOIP_B2BUA_REG_EXPIRES`: REGISTER refresh interval in seconds — default `600`
+
+In B2BUA NETNS mode, configure your SIP softphone or ATA as follows:
+- **SIP Server / Registrar**: your gateway IP address (shown in the web UI Status page)
+- **SIP Username**: your local username (or your ISP number if no local auth is set)
+- **SIP Password**: your local password (or your ISP password if no local auth is set)
+- **Transport**: UDP or TCP
+
+**B2BUA mode settings** (`ROUTING_MODE="b2bua"`) *(deprecated — use b2bua_netns)*
 
 * `VOIP_B2BUA_USER` / `VOIP_B2BUA_PASS` / `VOIP_B2BUA_DOMAIN`: ISP SIP credentials the B2BUA uses to register upstream to the IMS network
 
@@ -142,20 +163,20 @@ View logs and confirm the SIP address:
 journalctl -u voipd -f
 ```
 
-The status banner shows everything you need. In B2BUA mode:
+The status banner shows everything you need. In B2BUA NETNS mode:
 
 ```
 ==========================================================
  VoIP -- Running
 ==========================================================
-  Interface : voip (VLAN 11 on eth4)
+  Interface : voip (VLAN 11 on <wan-port>)
   VoIP IP   : 10.x.x.x
   Gateway   : 10.x.x.1
-  Routing   : b2bua (signaling-only SIP proxy)
+  Routing   : b2bua_netns (sandboxed SIP proxy via veth/netns)
   IMS subnet: 10.0.0.0/8
   NAT       : MASQUERADE in UBIOS_POSTROUTING_USER_HOOK
 ----------------------------------------------------------
-  SIP Proxy : 10.x.x.x  (upstream, used by B2BUA)
+  SIP Proxy : 10.x.x.x  (upstream P-CSCF, used by B2BUA)
   SIP Client: register to 192.168.x.1:5060 (local B2BUA)
 ==========================================================
 ```
@@ -166,10 +187,10 @@ In PBR mode:
 ==========================================================
  VoIP -- Running
 ==========================================================
-  Interface : voip (VLAN 11 on eth4)
+  Interface : voip (VLAN 11 on <wan-port>)
   VoIP IP   : 10.x.x.x
   Gateway   : 10.x.x.1
-  Routing   : PBR -> table 203 (voip)
+  Routing   : PBR -> table <n> (voip)
   IMS subnet: 10.0.0.0/8
   NAT       : MASQUERADE in UBIOS_POSTROUTING_USER_HOOK
 ----------------------------------------------------------
@@ -180,11 +201,11 @@ In PBR mode:
 Verify routing is correct (PBR and B2BUA modes):
 
 ```sh
-# Routing table
-ip route show table 203
+# Routing table (replace <n> with your VOIP_RT_TABLE value)
+ip route show table <n>
 
-# Policy rules (two entries at priority 100)
-ip rule show | grep "100:"
+# Policy rules (two entries at priority 100/101)
+ip rule show | grep -E "100:|101:"
 
 # Confirm IMS traffic exits via voip
 ip route get <your-ISP-SIP-proxy-IP>
@@ -315,8 +336,8 @@ Or enable it from the web UI under **Config → VPN Support**, tick the interfac
 **Q: What VLAN ID should I use?**
 A: See the local VLAN ID in your area — the default in this script is VLAN 11. You can verify by checking your ISP ONT web-ui WAN page or using OMCI commands via telnet from your aftermarket ONT unit.
 
-**Q: What is the difference between B2BUA and PBR mode?**
-A: In B2BUA mode, your LAN clients register to the gateway (e.g. `192.168.1.1:5060`) using a local account, and the gateway handles the upstream IMS registration on their behalf. Your ISP credentials never leave the router. In PBR mode, clients register directly to the ISP's SIP proxy — the gateway only handles the routing so packets take the right path.
+**Q: What is the difference between B2BUA NETNS, B2BUA, and PBR mode?**
+A: **B2BUA NETNS** (recommended): your LAN clients register to the gateway using a local account, and the gateway handles the upstream IMS registration inside a sandboxed network namespace. Upstream SIP/RTP passes through the FORWARD chain where UniFi applies ALIEN/TOR threat intelligence blocking and IPS unconditionally (the voip interface is not auto-zoned, but ALIEN and IPS are zone-independent FORWARD-chain rules). Requires a P-CSCF hostname to be set. **B2BUA** (deprecated): same SIP proxy concept but the process runs directly on the router without sandboxing — SIP traffic bypasses the firewall and security chains. **PBR**: clients register directly to the ISP's SIP proxy — the gateway only handles routing so packets take the correct path.
 
 **Q: Does B2BUA add latency?**
 A: No. The B2BUA only processes SIP signaling (REGISTER, INVITE, BYE, etc.). RTP media flows directly between your SIP client and the ISP's media servers — the gateway is not in the media path at all.

@@ -40,3 +40,6 @@ Thumbs.db
 
 # Internal token (generated at install time, never committed)
 ui/.internal-token
+
+# Claude Code project tooling (local dev workflow only, not part of the project)
+.claude/

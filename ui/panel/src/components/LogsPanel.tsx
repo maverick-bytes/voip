@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState, useCallback } from "react";
 import { RefreshCw, Loader2, Bug, Check, AlertCircle } from "lucide-react";
-import { postJson } from "@/lib/api";
+import { postJson, apiFetch } from "@/lib/api";
 
 // ── Inline toggle switch ──────────────────────────────────────────────────────
 
@@ -44,11 +44,24 @@ const LogsPanel = () => {
   const [toggling, setToggling]   = useState(false);
   const [toggleMsg, setToggleMsg] = useState<{ ok: boolean; text: string; phase: "restarting" | "done" } | null>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  // Tracks whether the user is scrolled to (or near) the bottom. Used to
+  // decide whether a new batch of log lines should auto-scroll the view.
+  // Without this, the 5s polling refresh yanks the view to the bottom on
+  // every update, making it impossible to scroll up and read older entries.
+  const isAtBottomRef = useRef(true);
+
+  const handleScroll = () => {
+    const el = containerRef.current;
+    if (!el) return;
+    const threshold = 32; // px tolerance to still count as "at bottom"
+    isAtBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < threshold;
+  };
 
   // ── Fetch logs ──────────────────────────────────────────────────────────────
   const fetchLogs = useCallback(async () => {
     try {
-      const res = await fetch("/voip/api/logs");
+      const res = await apiFetch("/voip/api/logs");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setLogs(await res.json());
       setError(null);
@@ -67,7 +80,7 @@ const LogsPanel = () => {
 
   // ── Load current debug state from config on mount ───────────────────────────
   useEffect(() => {
-    fetch("/voip/api/config")
+    apiFetch("/voip/api/config")
       .then(r => r.json())
       .then(data => setDebugMode(data.VOIP_DEBUG === "true"))
       .catch(() => setDebugMode(false));
@@ -75,7 +88,9 @@ const LogsPanel = () => {
 
   // ── Auto-scroll to bottom whenever new log lines arrive ─────────────────────
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    if (isAtBottomRef.current) {
+      bottomRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
   }, [logs]);
 
   // ── Toggle debug mode ────────────────────────────────────────────────────────
@@ -89,7 +104,7 @@ const LogsPanel = () => {
     setToggling(true);
     setToggleMsg({ ok: true, text: "Restarting voipd…", phase: "restarting" });
     try {
-      const cfgRes = await fetch("/voip/api/config");
+      const cfgRes = await apiFetch("/voip/api/config");
       if (!cfgRes.ok) throw new Error("Failed to read config");
       const cfg = await cfgRes.json();
       cfg.VOIP_DEBUG = next ? "true" : "false";
@@ -169,7 +184,11 @@ const LogsPanel = () => {
       )}
 
       {/* Log output */}
-      <div className="bg-sidebar text-sidebar-foreground font-mono text-xs overflow-auto max-h-[calc(100vh-270px)]">
+      <div
+        ref={containerRef}
+        onScroll={handleScroll}
+        className="bg-sidebar text-sidebar-foreground font-mono text-xs overflow-auto max-h-[calc(100vh-270px)]"
+      >
         {error ? (
           <div className="p-4 text-destructive">{error}</div>
         ) : logs.length === 0 && !loading ? (

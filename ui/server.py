@@ -111,7 +111,7 @@ def api_status():
     b2bua_registered = None
     b2bua_clients = None
     b2bua_listen_port = conf.get("VOIP_B2BUA_LISTEN_PORT", "5060")
-    if routing_mode == "b2bua":
+    if routing_mode in ("b2bua", "b2bua_netns"):
         b2bua_status_file = STATE_DIR / "b2bua_status"
         if b2bua_status_file.exists():
             for line in b2bua_status_file.read_text().splitlines():
@@ -133,7 +133,7 @@ def api_status():
         "wanInterface": conf.get("VOIP_WAN_INTERFACE", ""),
         "voipIp":       read_state("voip_ip"),
         "gateway":      read_state("gw"),
-        "routingMode":  routing_mode.upper(),
+        "routingMode":  routing_mode,
         "routingTable": conf.get("VOIP_RT_TABLE", ""),
         "imsSubnet":    read_state("subnet"),
         "natRule":      "MASQUERADE in UBIOS_POSTROUTING_USER_HOOK",
@@ -519,7 +519,7 @@ def api_command(body: dict):
             "ip route show table "
             "$(grep -E '^[0-9]+ voip' /etc/iproute2/rt_tables "
             "| awk '{print $1}') 2>/dev/null; "
-            "ip rule show | grep '100:'",
+            "ip rule show | grep -E '99:|100:|101:'",
         "restart": "systemctl restart voipd",
         "stop":    "systemctl stop voipd",
         "start":   "systemctl start voipd",

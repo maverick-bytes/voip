@@ -1,4 +1,5 @@
 import { useState, useEffect } from "react";
+import { apiFetch } from "@/lib/api";
 
 export interface NetworkInterface {
   name: string;
@@ -17,7 +18,7 @@ export function useNetworkInterfaces() {
     const fetchInterfaces = async () => {
       setLoading(true);
       try {
-        const res = await fetch("/voip/api/interfaces");
+        const res = await apiFetch("/voip/api/interfaces");
         if (!res.ok) throw new Error(`HTTP ${res.status}`);
         const data = await res.json();
         setWanInterfaces(data.wanInterfaces ?? []);

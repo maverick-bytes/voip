@@ -6,21 +6,35 @@
 # the Free Software Foundation; either version 2 of the License, or
 # (at your option) any later version.
 #
-# Three routing modes available — see ROUTING_MODE below:
+# Four routing modes available — see ROUTING_MODE below:
 #
-#   b2bua  (default)  Signaling-only Back-to-Back User Agent.
-#                     A Python SIP proxy runs on the router; LAN clients
-#                     register to it with a local SIP account instead of
-#                     registering to the ISP directly.  RTP still flows
-#                     peer-to-peer — no media is relayed, no extra latency.
-#                     Uses the same voip routing table (203) as pbr mode so
-#                     the B2BUA process's upstream SIP exits via the voip interface.
-#                     Requires VOIP_B2BUA_USER / PASS / DOMAIN to be set.
+#   b2bua_netns  (default, recommended)
+#                     Sandboxed Back-to-Back User Agent.  The B2BUA process
+#                     runs inside a Linux network namespace connected to the
+#                     router via a veth pair.  All SIP traffic passes through
+#                     router via a veth pair.  Upstream SIP/RTP is forwarded
+#                     traffic (not router-originated), so it passes through the
+#                     FORWARD chain where UniFi applies ALIEN/TOR threat
+#                     intelligence blocking and IPS unconditionally.  Note: the
+#                     voip interface is not auto-zoned by UniFi (only UI-managed
+#                     interfaces are), so zone-specific rules do not apply here,
+#                     but ALIEN and IPS are zone-independent FORWARD-chain rules.
+#                     Requires VOIP_B2BUA_USER / PASS / DOMAIN and
+#                     PCSCF_HOSTNAME to be set.
+#
+#   b2bua        (deprecated)
+#                     Signaling-only Back-to-Back User Agent (non-sandboxed).
+#                     The B2BUA process runs directly on the router; SIP traffic
+#                     upstream SIP/RTP is router-originated (OUTPUT chain) so
+#                     it does not pass through FORWARD-chain rules such as
+#                     ALIEN/TOR blocking or IPS.  Use b2bua_netns instead.
+#                     PCSCF_HOSTNAME is not required.  Kept for compatibility —
+#                     use b2bua_netns for new deployments.
 #
 #   pbr               Policy-Based Routing.
-#                     Creates a dedicated routing table
-#                     and ip rules so IMS traffic always exits via voip,
-#                     regardless of UniFiOS default WAN priority.
+#                     Creates a dedicated routing table and ip rules so IMS
+#                     traffic always exits via the voip interface, regardless
+#                     of UniFiOS default WAN priority.
 #
 #   forward           Forward VoIP traffic through a specific existing
 #                     interface/VLAN instead of the voip interface itself.
@@ -38,7 +52,7 @@ VOIP_WAN_VLAN="11"
 VOIP_WAN_VLAN_INTERFACE="voip"
 VOIP_WAN_VLAN_INTERFACE_EGRESS_QOS="0:5 1:5 2:5 3:5 4:5 5:5 6:5 7:5"
 PCSCF_HOSTNAME="p-cscf.example.com"
-ROUTING_MODE="b2bua"
+ROUTING_MODE="b2bua_netns"
 VOIP_RT_TABLE="203"
 VOIP_RT_TABLE_NAME="voip"
 VOIP_FORWARD_INTERFACE=""
@@ -202,6 +216,12 @@ _detect_voip_config() {
     if [ -n "$VOIP_IMS_SUBNET" ]; then
         VOIP_DEST_SUBNET="$VOIP_IMS_SUBNET"
         echo "  IMS subnet : $VOIP_DEST_SUBNET (manual override)"
+    elif [ -s "$VOIP_STATE_DIR/subnet" ]; then
+        # Use the subnet resolved during initial startup — avoids re-doing DNS
+        # on watchdog restores when the IMS DNS server may be temporarily
+        # unreachable (it lives in the IMS subnet we are trying to restore).
+        VOIP_DEST_SUBNET=$(cat "$VOIP_STATE_DIR/subnet")
+        echo "  IMS subnet : $VOIP_DEST_SUBNET (cached)"
     elif [ -z "$PCSCF_HOSTNAME" ]; then
         echo "ERROR: PCSCF_HOSTNAME is not set and VOIP_IMS_SUBNET is not set."
         echo "       Set PCSCF_HOSTNAME so the IMS subnet can be derived from the"
@@ -212,8 +232,8 @@ _detect_voip_config() {
         # Its IP directly tells us which RFC-1918 block all IMS traffic lives on.
         #
         # Problem: the ISP DNS server is on the VoIP subnet and is only reachable
-        # after routing table 203 is installed — but we need the subnet to install
-        # routing table 203.  To break this chicken-and-egg dependency we add a
+        # after routing voip routing table is installed — but we need the subnet to install
+        # routing voip routing table.  To break this chicken-and-egg dependency we add a
         # temporary default route via the VoIP gateway just long enough to perform
         # the DNS lookup, then remove it.  The proper PBR/B2BUA rules are installed
         # immediately after this function returns.
@@ -394,12 +414,19 @@ _routing_setup_pbr() {
     ip rule del to   "$VOIP_DEST_SUBNET" priority 100 2>/dev/null || true
     ip rule del from "$VOIP_IP"          priority 100 2>/dev/null || true
     ip route flush table "$VOIP_RT_TABLE" 2>/dev/null || true
+    local _setup_fwmark
+    _setup_fwmark=$(iptables -t mangle -L PREROUTING -n 2>/dev/null \
+        | awk '/MARK xset/{match($0,/0x[0-9a-f]+\/0x[0-9a-f]+/); \
+               if(RSTART){print substr($0,RSTART,RLENGTH); exit}}')
+    [ -z "$_setup_fwmark" ] && \
+        _setup_fwmark=$(cat "$VOIP_STATE_DIR/fwmark" 2>/dev/null || echo "0x1e0000/0x7e0000")
+    echo "$_setup_fwmark" > "$VOIP_STATE_DIR/fwmark"
     while iptables -t mangle -D PREROUTING \
-        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null; do :; done
+        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark "$_setup_fwmark" 2>/dev/null; do :; done
     while iptables -t mangle -D PREROUTING \
         -d "$VOIP_DEST_SUBNET" -j CONNMARK --save-mark --nfmask 0x7e0000 2>/dev/null; do :; done
     while iptables -t mangle -D PREROUTING \
-        -m connmark --mark 0x1e0000/0x7e0000 \
+        -m connmark --mark "$_setup_fwmark" \
         -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null; do :; done
 
     ip route add default via "$gw" dev "$VOIP_WAN_VLAN_INTERFACE" table "$VOIP_RT_TABLE"
@@ -414,11 +441,11 @@ _routing_setup_pbr() {
     # on the voip routing table even if conntrack is briefly disrupted, which
     # prevents mid-call audio muting when the watchdog restores rules.
     iptables -t mangle -I PREROUTING 1 \
-        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark 0x1e0000/0x7e0000
+        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark "$_setup_fwmark"
     iptables -t mangle -I PREROUTING 2 \
         -d "$VOIP_DEST_SUBNET" -j CONNMARK --save-mark --nfmask 0x7e0000
     iptables -t mangle -I PREROUTING 3 \
-        -m connmark --mark 0x1e0000/0x7e0000 \
+        -m connmark --mark "$_setup_fwmark" \
         -j CONNMARK --restore-mark --nfmask 0x7e0000
     echo "  Mangle     : PREROUTING dst $VOIP_DEST_SUBNET -> MARK + CONNMARK save/restore"
 
@@ -434,98 +461,97 @@ _routing_setup_pbr() {
     #   - LAN clients: handled via UBIOS_LAN_IN_USER (UniFi's own LAN chain)
     #   - VPN clients: handled via UBIOS_VPN_WAN_USER (default ACCEPT for VPN->WAN)
     #   - Return traffic: handled by FORWARD rule 1 (global RELATED,ESTABLISHED)
-    # This ensures IPS, DPI, ALIEN, TOR, and zone firewall rules all apply.
+    # This keeps ALIEN/TOR blocking and IPS in the FORWARD chain effective.
     _wan_subif_rp_set
 
     iptables -C UBIOS_LAN_IN_USER -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
         || iptables -I UBIOS_LAN_IN_USER 1 -d "$VOIP_DEST_SUBNET" -j ACCEPT
     echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET"
     if [ -n "$VOIP_VPN_INTERFACES" ]; then
-        echo "  VPN        : $VOIP_VPN_INTERFACES allowed via UBIOS_VPN_WAN_USER (zone firewall applies)"
+        echo "  VPN        : $VOIP_VPN_INTERFACES allowed via UBIOS_VPN_WAN_USER"
     fi
 }
 
-_routing_teardown_pbr() {
-    local subnet voip_ip
-    subnet=$(cat  "$VOIP_STATE_DIR/subnet"  2>/dev/null || echo "10.0.0.0/8")
-    voip_ip=$(cat "$VOIP_STATE_DIR/voip_ip" 2>/dev/null || echo "")
-
-    ip rule del to "$subnet" priority 100              2>/dev/null || true
-    [ -n "$voip_ip" ] && \
-        ip rule del from "$voip_ip" priority 100       2>/dev/null || true
-    ip route flush table "$VOIP_RT_TABLE"               2>/dev/null || true
-
-    iptables -t mangle -D PREROUTING \
-        -d "$subnet" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null || true
-    iptables -t mangle -D PREROUTING \
-        -d "$subnet" -j CONNMARK --save-mark --nfmask 0x7e0000 2>/dev/null || true
-    iptables -t mangle -D PREROUTING \
-        -m connmark --mark 0x1e0000/0x7e0000 \
-        -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null || true
-    iptables -t nat -D "$UBIOS_NAT_CHAIN" \
-        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE 2>/dev/null || true
-
-    iptables -D UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null || true
-    sed -i "/^$VOIP_RT_TABLE /d" /etc/iproute2/rt_tables 2>/dev/null || true
-}
 
 # ── Forward routing mode ──────────────────────────────────────────────────────
-# Instead of a dedicated VoIP VLAN, route IMS-bound traffic through an
-# existing interface (e.g. a pre-existing WAN VLAN managed by UniFiOS).
+# Routes IMS-bound traffic from one or more configured interfaces through the
+# voip routing table, steering it out via the voip WAN interface.  Uses the
+# same fwmark / routing-table mechanism as PBR, but restricts the mangle MARK
+# rules to traffic arriving on the configured interface(s) only, leaving all
+# other LAN traffic on its default WAN path.
 
 _routing_setup_forward() {
     if [ -z "$VOIP_FORWARD_INTERFACE" ]; then
         echo "ERROR: ROUTING_MODE=forward but VOIP_FORWARD_INTERFACE is not set"
         return 1
     fi
-    if ! ip link show "$VOIP_FORWARD_INTERFACE" >/dev/null 2>&1; then
-        echo "ERROR: forward interface $VOIP_FORWARD_INTERFACE does not exist"
-        return 1
-    fi
+
+    # Validate every configured interface (VOIP_FORWARD_INTERFACE is space-separated)
+    for _fwd_iface_chk in $VOIP_FORWARD_INTERFACE; do
+        if ! ip link show "$_fwd_iface_chk" >/dev/null 2>&1; then
+            echo "ERROR: forward interface $_fwd_iface_chk does not exist"
+            return 1
+        fi
+    done
 
     local gw
-    if [ -n "$VOIP_FORWARD_GATEWAY" ]; then
-        gw="$VOIP_FORWARD_GATEWAY"
-    else
-        gw=$(_get_gateway_for_iface "$VOIP_FORWARD_INTERFACE")
-        [ -z "$gw" ] && echo "ERROR: cannot determine gateway for $VOIP_FORWARD_INTERFACE" && return 1
-    fi
+    gw=$(_get_gateway_for_iface "$VOIP_WAN_VLAN_INTERFACE")
+    [ -z "$gw" ] && \
+        echo "ERROR: cannot determine gateway for $VOIP_WAN_VLAN_INTERFACE" && return 1
 
-    echo "  Mode       : forward (via $VOIP_FORWARD_INTERFACE)"
+    echo "  Mode       : forward ($VOIP_FORWARD_INTERFACE -> $VOIP_WAN_VLAN_INTERFACE)"
     echo "  Gateway    : $gw"
-    echo "$gw" > "$VOIP_STATE_DIR/gw"
+    echo "$gw"                    > "$VOIP_STATE_DIR/gw"
     echo "$VOIP_FORWARD_INTERFACE" > "$VOIP_STATE_DIR/forward_iface"
 
-    ip route del "$VOIP_DEST_SUBNET" 2>/dev/null || true
-    ip route add "$VOIP_DEST_SUBNET" via "$gw" dev "$VOIP_FORWARD_INTERFACE" metric 10
-    echo "  Route      : $VOIP_DEST_SUBNET via $gw dev $VOIP_FORWARD_INTERFACE (metric 10)"
+    grep -q "^$VOIP_RT_TABLE " /etc/iproute2/rt_tables 2>/dev/null \
+        || echo "$VOIP_RT_TABLE $VOIP_RT_TABLE_NAME" >> /etc/iproute2/rt_tables
 
+    # ── Flush stale state ──────────────────────────────────────────────────
+    ip route flush table "$VOIP_RT_TABLE" 2>/dev/null || true
+    while ip rule del priority 101 2>/dev/null; do :; done
+
+    # ── Routing table ──────────────────────────────────────────────────────
+    ip route add "$VOIP_DEST_SUBNET" via "$gw" dev "$VOIP_WAN_VLAN_INTERFACE" \
+        table "$VOIP_RT_TABLE"
+    ip route add default             via "$gw" dev "$VOIP_WAN_VLAN_INTERFACE" \
+        table "$VOIP_RT_TABLE"
+    echo "  Table $VOIP_RT_TABLE    : $VOIP_DEST_SUBNET + default via $gw dev $VOIP_WAN_VLAN_INTERFACE"
+
+    # ── IP rules ───────────────────────────────────────────────────────────
+    # Routing is selected purely on (incoming interface, destination subnet) —
+    # not on fwmark/connmark.  UniFiOS maintains its own CONNMARK save/restore
+    # for multi-WAN policy routing using marks in the same range as ours; that
+    # mark gets restored onto IMS reply packets regardless of anything this
+    # daemon does.  A fwmark-based rule would then incorrectly match those
+    # replies (dst = LAN client) and send them back out the voip interface.
+    # An iif+to rule cannot match a reply packet (wrong iif, wrong dst), so
+    # replies always fall through to the main table's existing route to the
+    # forward interface.
+    ip rule add from "$VOIP_IP" lookup "$VOIP_RT_TABLE" priority 99
+    echo "  Rules      : from $VOIP_IP -> table $VOIP_RT_TABLE (priority 99)"
+    for _iface in $VOIP_FORWARD_INTERFACE; do
+        ip rule add iif "$_iface" to "$VOIP_DEST_SUBNET" lookup "$VOIP_RT_TABLE" priority 101
+        echo "  Rules      : iif $_iface to $VOIP_DEST_SUBNET -> table $VOIP_RT_TABLE (priority 101)"
+    done
+
+    # ── NAT ────────────────────────────────────────────────────────────────
     iptables -t nat -C "$UBIOS_NAT_CHAIN" \
-        -o "$VOIP_FORWARD_INTERFACE" -d "$VOIP_DEST_SUBNET" -j MASQUERADE 2>/dev/null \
+        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE 2>/dev/null \
     || iptables -t nat -A "$UBIOS_NAT_CHAIN" \
-        -o "$VOIP_FORWARD_INTERFACE" -d "$VOIP_DEST_SUBNET" -j MASQUERADE
-    echo "  NAT        : MASQUERADE in $UBIOS_NAT_CHAIN on $VOIP_FORWARD_INTERFACE"
+        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE
+    echo "  NAT        : MASQUERADE in $UBIOS_NAT_CHAIN on $VOIP_WAN_VLAN_INTERFACE"
 
-    # Same reasoning as PBR: use UBIOS_LAN_IN_USER and UBIOS_VPN_WAN_USER instead
-    # of raw FORWARD -j ACCEPT rules that would bypass IPS/firewall chains.
+    _wan_subif_rp_set
+
     iptables -C UBIOS_LAN_IN_USER -d "$VOIP_DEST_SUBNET" -j ACCEPT 2>/dev/null \
         || iptables -I UBIOS_LAN_IN_USER 1 -d "$VOIP_DEST_SUBNET" -j ACCEPT
     echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET"
     if [ -n "$VOIP_VPN_INTERFACES" ]; then
-        echo "  VPN        : $VOIP_VPN_INTERFACES allowed via UBIOS_VPN_WAN_USER (zone firewall applies)"
+        echo "  VPN        : $VOIP_VPN_INTERFACES allowed via UBIOS_VPN_WAN_USER"
     fi
 }
 
-_routing_teardown_forward() {
-    local subnet fwd_iface
-    subnet=$(cat    "$VOIP_STATE_DIR/subnet"        2>/dev/null || echo "10.0.0.0/8")
-    fwd_iface=$(cat "$VOIP_STATE_DIR/forward_iface" 2>/dev/null || echo "$VOIP_FORWARD_INTERFACE")
-
-    ip route del "$subnet" 2>/dev/null || true
-    iptables -t nat -D "$UBIOS_NAT_CHAIN" \
-        -o "$fwd_iface" -d "$subnet" -j MASQUERADE 2>/dev/null || true
-    iptables -D UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null || true
-}
 
 # ── B2BUA routing mode ────────────────────────────────────────────────────────
 # Signaling-only SIP B2BUA (b2bua.py).  Sets up the voip routing table (203)
@@ -575,6 +601,200 @@ _b2bua_stop() {
     fi
 }
 
+# ── B2BUA NETNS (veth/network-namespace) functions ──────────────────────────
+# These implement the b2bua_netns routing mode which runs the B2BUA inside
+# a Linux network namespace.  Upstream SIP/RTP exits as FORWARD traffic
+# (namespace → b2bua_v0 → voip), so ALIEN/TOR blocking and IPS apply
+# unconditionally.  The voip interface is not auto-zoned by UniFi so
+# zone-specific rules do not apply, but ALIEN and IPS are zone-independent.
+# Requires PCSCF_HOSTNAME to be set (used to determine the IMS subnet).
+
+_b2bua_netns_start() {
+    if [ -z "$VOIP_B2BUA_USER" ] || [ -z "$VOIP_B2BUA_PASS" ] || [ -z "$VOIP_B2BUA_DOMAIN" ]; then
+        echo "  B2BUA  : ERROR — VOIP_B2BUA_USER, VOIP_B2BUA_PASS and VOIP_B2BUA_DOMAIN must be set"
+        return 1
+    fi
+    if [ ! -f /data/voip/b2bua.py ]; then
+        echo "  B2BUA  : ERROR — /data/voip/b2bua.py not found"
+        return 1
+    fi
+    
+    # 1. Setup Sandbox Network Namespace
+    ip netns add b2bua_ns 2>/dev/null || true
+    ip link add b2bua_v0 type veth peer name b2bua_v1 2>/dev/null || true
+    ip link set b2bua_v1 netns b2bua_ns 2>/dev/null || true
+
+    # 2. Configure Host Side (Main Router)
+    ip addr add 172.31.255.1/30 dev b2bua_v0 2>/dev/null || true
+    ip link set b2bua_v0 up 2>/dev/null || true
+
+    # 3. Configure Sandbox Side
+    ip netns exec b2bua_ns ip addr add 172.31.255.2/30 dev b2bua_v1 2>/dev/null || true
+    ip netns exec b2bua_ns ip link set b2bua_v1 up 2>/dev/null || true
+    ip netns exec b2bua_ns ip link set lo up 2>/dev/null || true
+    ip netns exec b2bua_ns ip route add default via 172.31.255.1 2>/dev/null || true
+    # Ensure no VOIP_IP alias exists on b2bua_v1 — if it does, the kernel
+    # picks it as source (same /8 as IMS), MASQUERADE won't fire, and
+    # conntrack creates no NAT entry so IMS replies find no socket.
+    ip netns exec b2bua_ns ip addr del "$VOIP_IP/32" dev b2bua_v1 2>/dev/null || true
+
+    local pcscf_ip
+    pcscf_ip=$(cat "$VOIP_STATE_DIR/pcscf_ip" 2>/dev/null | grep -v unresolved || echo "")
+    [ -z "$pcscf_ip" ] && pcscf_ip="$PCSCF_HOSTNAME"
+    echo "  B2BUA  : starting sandbox (${VOIP_B2BUA_USER}@${VOIP_B2BUA_DOMAIN} via ${pcscf_ip})"
+    
+    env B2BUA_PROXY="$pcscf_ip" \
+    B2BUA_DOMAIN="$VOIP_B2BUA_DOMAIN" \
+    B2BUA_USER="$VOIP_B2BUA_USER" \
+    B2BUA_PASS="$VOIP_B2BUA_PASS" \
+    B2BUA_VOIP_IP="$VOIP_IP" \
+    B2BUA_LOCAL_PORT="$VOIP_B2BUA_LISTEN_PORT" \
+    B2BUA_LOCAL_USER="$VOIP_B2BUA_LOCAL_USER" \
+    B2BUA_LOCAL_PASS="$VOIP_B2BUA_LOCAL_PASS" \
+    B2BUA_REG_EXPIRES="$VOIP_B2BUA_REG_EXPIRES" \
+    B2BUA_STATE_DIR="$VOIP_STATE_DIR" \
+    B2BUA_DEBUG="$VOIP_DEBUG" \
+    B2BUA_WAN_IFACE="$VOIP_WAN_VLAN_INTERFACE" \
+    B2BUA_NETNS="true" \
+    B2BUA_LAN_IP="$(ip -o -4 addr show dev br0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)" \
+    ip netns exec b2bua_ns python3 /data/voip/b2bua.py >> "$VOIP_STATE_DIR/b2bua.log" 2>&1 &
+    
+    echo $! > "$VOIP_STATE_DIR/b2bua_pid"
+    echo "  B2BUA  : PID $(cat $VOIP_STATE_DIR/b2bua_pid) (Sandbox IP: 172.31.255.2)"
+}
+
+_b2bua_netns_stop() {
+    if [ -f "$VOIP_STATE_DIR/b2bua_pid" ]; then
+        local pid
+        pid=$(cat "$VOIP_STATE_DIR/b2bua_pid")
+        kill "$pid" 2>/dev/null || true
+        # Wait for process to fully exit before destroying namespace/veth
+        local _w=0
+        while kill -0 "$pid" 2>/dev/null && [ $_w -lt 5 ]; do
+            sleep 1; _w=$((_w+1))
+        done
+        rm -f "$VOIP_STATE_DIR/b2bua_pid" "$VOIP_STATE_DIR/b2bua_status"
+        echo "  B2BUA  : stopped (PID $pid)"
+    fi
+    ip link del b2bua_v0 2>/dev/null || true
+    ip netns del b2bua_ns 2>/dev/null || true
+}
+
+_routing_setup_b2bua_netns() {
+    local gw
+    gw=$(_get_gateway_for_iface "$VOIP_WAN_VLAN_INTERFACE")
+    [ -z "$gw" ] && echo "ERROR: cannot determine gateway" && return 1
+
+    echo "  Mode       : b2bua_netns (Sandboxed SIP proxy)"
+    echo "  Gateway    : $gw"
+    echo "$gw" > "$VOIP_STATE_DIR/gw"
+
+    # ── 1. Routing voip routing table ─────────────────────────────────────────────────
+    grep -q "^$VOIP_RT_TABLE " /etc/iproute2/rt_tables 2>/dev/null \
+        || echo "$VOIP_RT_TABLE $VOIP_RT_TABLE_NAME" >> /etc/iproute2/rt_tables
+
+    ip route flush table "$VOIP_RT_TABLE" 2>/dev/null || true
+    ip route add "$VOIP_DEST_SUBNET" via "$gw" dev "$VOIP_WAN_VLAN_INTERFACE" table "$VOIP_RT_TABLE"
+    ip route add 172.31.255.0/30 dev b2bua_v0 table "$VOIP_RT_TABLE" 2>/dev/null || true
+    ip route add 172.31.255.0/30 dev b2bua_v0 2>/dev/null || true
+    echo "  Table $VOIP_RT_TABLE    : $VOIP_DEST_SUBNET via $gw + 172.31.255.0/30 dev b2bua_v0"
+
+    # ── 2. IP rules — subnet only in route table, never in ip rule ───────────
+    # Clean stale rules from all previous variants
+    ip rule del from 172.31.255.2                        priority 100 2>/dev/null || true
+    ip rule del from 172.31.255.2 to "$VOIP_DEST_SUBNET" priority 100 2>/dev/null || true
+    ip rule del iif b2bua_v0                             priority 100 2>/dev/null || true
+    ip rule del to   "$VOIP_DEST_SUBNET"                 priority 100 2>/dev/null || true
+    ip rule del from "$VOIP_IP"                          priority 99  2>/dev/null || true
+    ip rule del from "$VOIP_IP" to "$VOIP_DEST_SUBNET"   priority 99  2>/dev/null || true
+    ip rule del from "$VOIP_IP"                          priority 100 2>/dev/null || true
+    ip rule del fwmark 0x1e0000/0x1e0000 lookup "$VOIP_RT_TABLE" priority 100 2>/dev/null || true
+    ip rule del fwmark 0x1e0000/0x7e0000 lookup "$VOIP_RT_TABLE" priority 101 2>/dev/null || true
+
+    # iif b2bua_v0: netns SIP traffic → voip routing table
+    ip rule add iif b2bua_v0 lookup "$VOIP_RT_TABLE" priority 100
+    # from VOIP_IP: upstream SIP source address → voip routing table
+    ip rule add from "$VOIP_IP" lookup "$VOIP_RT_TABLE" priority 99
+
+    echo "  Rules      : iif b2bua_v0 -> table $VOIP_RT_TABLE (p100)"
+    echo "  Rules      : from $VOIP_IP -> table $VOIP_RT_TABLE (p99)"
+
+    # LAN/VPN client RTP to IMS needs a route in the main table.
+    # LAN RTP does not originate from b2bua_v0 or from VOIP_IP, so neither
+    # of the two ip rules above match — it falls through to the main table.
+    # A single subnet route here is sufficient; no per-call routes needed.
+    ip route add "$VOIP_DEST_SUBNET" via "$gw" dev "$VOIP_WAN_VLAN_INTERFACE" 2>/dev/null || true
+    echo "  Main table : $VOIP_DEST_SUBNET via $gw dev $VOIP_WAN_VLAN_INTERFACE (LAN RTP)"
+
+    # ── 3. Mangle ────────────────────────────────────────────────────────────
+    # UniFiOS already installs MARK + CONNMARK save/restore rules for the voip
+    # table. We do NOT add duplicates.
+
+    # WAN subif CT --notrack/DNAT not needed: with B2BUA_NETNS=true the b2bua
+    # binds to 0.0.0.0, sends from 172.31.255.2, MASQUERADE rewrites to VOIP_IP,
+    # and conntrack's reverse NAT automatically delivers IMS replies back to
+    # 172.31.255.2 inside the netns — regardless of which WAN subif they arrive on.
+
+    # ── 4. NAT ───────────────────────────────────────────────────────────────
+    # DNAT: all SIP to any local address → b2bua netns.
+    # so this single pair of rules handles:
+    # ! -i b2bua_v0 prevents the netns reply traffic from looping back.
+    iptables -t nat -I PREROUTING 1 ! -i b2bua_v0 -p udp \
+        --dport "$VOIP_B2BUA_LISTEN_PORT" -m addrtype --dst-type LOCAL \
+        -j DNAT --to-destination 172.31.255.2
+    iptables -t nat -I PREROUTING 1 ! -i b2bua_v0 -p tcp \
+        --dport "$VOIP_B2BUA_LISTEN_PORT" -m addrtype --dst-type LOCAL \
+        -j DNAT --to-destination 172.31.255.2
+    # MASQUERADE: namespace→voip (IMS must see VOIP_IP — MASQUERADE uses the
+    # voip interface IP = VOIP_IP; this survives UniFiOS iptables rewrites via
+    # UBIOS_POSTROUTING_USER_HOOK, unlike a direct POSTROUTING SNAT rule)
+    # Also: namespace→LAN (so BYE/responses appear from the correct gateway IP)
+    iptables -t nat -C "$UBIOS_NAT_CHAIN" \
+        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A "$UBIOS_NAT_CHAIN" \
+        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE
+    iptables -t nat -C "$UBIOS_NAT_CHAIN" \
+        -s 172.31.255.2 ! -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE 2>/dev/null \
+    || iptables -t nat -A "$UBIOS_NAT_CHAIN" \
+        -s 172.31.255.2 ! -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE
+    echo "  NAT        : DNAT :$VOIP_B2BUA_LISTEN_PORT -> 172.31.255.2"
+    echo "  NAT        : SNAT 172.31.255.2 -> $VOIP_IP on $VOIP_WAN_VLAN_INTERFACE"
+
+    # ── 5. FORWARD rules for b2bua_v0 veth ────────────────────────────────
+    # b2bua_v0 is not assigned to any UniFi zone (custom veth pairs never
+    # are).  These rules permit traffic through the FORWARD chain in both
+    # directions.  They sit AFTER the unconditional ALIEN and IPS targets
+    # so threat intelligence and IPS still apply to this traffic first.
+    iptables -C FORWARD -i b2bua_v0 -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -i b2bua_v0 -j ACCEPT
+    iptables -C FORWARD -o b2bua_v0 -j ACCEPT 2>/dev/null \
+        || iptables -A FORWARD -o b2bua_v0 -j ACCEPT
+    _wan_subif_rp_set
+    
+    # Block LAN clients from reaching IMS SIP (port 5060) directly.
+    # Without this, clients that resolve the IMS domain directly bypass the
+    # b2bua entirely — breaking inbound forking, auth, and call state.
+    # RTP is unaffected (different ports, peer-to-peer by design).
+    iptables -C FORWARD ! -i b2bua_v0 -d "$VOIP_DEST_SUBNET" -p udp \
+        --dport "$VOIP_B2BUA_LISTEN_PORT" -j DROP 2>/dev/null \
+    || iptables -I FORWARD 1 ! -i b2bua_v0 -d "$VOIP_DEST_SUBNET" -p udp \
+        --dport "$VOIP_B2BUA_LISTEN_PORT" -j DROP
+    iptables -C FORWARD ! -i b2bua_v0 -d "$VOIP_DEST_SUBNET" -p tcp \
+        --dport "$VOIP_B2BUA_LISTEN_PORT" -j DROP 2>/dev/null \
+    || iptables -I FORWARD 1 ! -i b2bua_v0 -d "$VOIP_DEST_SUBNET" -p tcp \
+        --dport "$VOIP_B2BUA_LISTEN_PORT" -j DROP
+    echo "  FW DROP    : FORWARD !b2bua_v0 dst $VOIP_DEST_SUBNET port $VOIP_B2BUA_LISTEN_PORT (force b2bua)"
+    
+    # Crucial for B2BUA: Prevent rp_filter from dropping incoming IMS SIP responses
+    echo 0 > "/proc/sys/net/ipv4/conf/$VOIP_WAN_VLAN_INTERFACE/rp_filter" 2>/dev/null || true
+    echo "  rp_filter  : Disabled on $VOIP_WAN_VLAN_INTERFACE for incoming IMS SIP responses"
+
+    iptables -C UBIOS_LAN_IN_USER -d 172.31.255.2 -j ACCEPT 2>/dev/null \
+        || iptables -I UBIOS_LAN_IN_USER 1 -d 172.31.255.2 -j ACCEPT
+    echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst 172.31.255.2"
+    echo "  Sandbox routing complete."
+}
+
 _routing_setup_b2bua() {
     local gw
     gw=$(_get_gateway_for_iface "$VOIP_WAN_VLAN_INTERFACE")
@@ -599,12 +819,19 @@ _routing_setup_b2bua() {
         -d "$VOIP_DEST_SUBNET" -p udp --dport 5060 -j RETURN 2>/dev/null; do :; done
     while iptables -t mangle -D PREROUTING \
         -d "$VOIP_DEST_SUBNET" -p tcp --dport 5060 -j RETURN 2>/dev/null; do :; done
+    local _setup_fwmark
+    _setup_fwmark=$(iptables -t mangle -L PREROUTING -n 2>/dev/null \
+        | awk '/MARK xset/{match($0,/0x[0-9a-f]+\/0x[0-9a-f]+/); \
+               if(RSTART){print substr($0,RSTART,RLENGTH); exit}}')
+    [ -z "$_setup_fwmark" ] && \
+        _setup_fwmark=$(cat "$VOIP_STATE_DIR/fwmark" 2>/dev/null || echo "0x1e0000/0x7e0000")
+    echo "$_setup_fwmark" > "$VOIP_STATE_DIR/fwmark"
     while iptables -t mangle -D PREROUTING \
-        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null; do :; done
+        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark "$_setup_fwmark" 2>/dev/null; do :; done
     while iptables -t mangle -D PREROUTING \
         -d "$VOIP_DEST_SUBNET" -j CONNMARK --save-mark --nfmask 0x7e0000 2>/dev/null; do :; done
     while iptables -t mangle -D PREROUTING \
-        -m connmark --mark 0x1e0000/0x7e0000 \
+        -m connmark --mark "$_setup_fwmark" \
         -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null; do :; done
 
     ip route add default via "$gw" dev "$VOIP_WAN_VLAN_INTERFACE" table "$VOIP_RT_TABLE"
@@ -619,9 +846,9 @@ _routing_setup_b2bua() {
     # attempting direct IMS SIP gets no route and fails naturally — no DROP rules
     # needed anywhere.
     ip rule add from "$VOIP_IP" lookup "$VOIP_RT_TABLE" priority 100
-    ip rule add fwmark 0x1e0000/0x7e0000 lookup "$VOIP_RT_TABLE" priority 101
+    ip rule add fwmark "$_setup_fwmark" lookup "$VOIP_RT_TABLE" priority 101
     echo "  Rules      : from $VOIP_IP -> table $VOIP_RT_TABLE (priority 100)"
-    echo "  Rules      : fwmark 0x1e0000 -> table $VOIP_RT_TABLE (priority 101)"
+    echo "  Rules      : fwmark $_setup_fwmark -> table $VOIP_RT_TABLE (priority 101)"
 
     # RETURN port 5060 before MARK — unmarked SIP has no route to the IMS subnet
     # from a LAN client.  All other traffic (RTP on high ports) is marked normally.
@@ -630,11 +857,11 @@ _routing_setup_b2bua() {
     iptables -t mangle -I PREROUTING 2 \
         -d "$VOIP_DEST_SUBNET" -p tcp --dport 5060 -j RETURN
     iptables -t mangle -I PREROUTING 3 \
-        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark 0x1e0000/0x7e0000
+        -d "$VOIP_DEST_SUBNET" -j MARK --set-xmark "$_setup_fwmark"
     iptables -t mangle -I PREROUTING 4 \
         -d "$VOIP_DEST_SUBNET" -j CONNMARK --save-mark --nfmask 0x7e0000
     iptables -t mangle -I PREROUTING 5 \
-        -m connmark --mark 0x1e0000/0x7e0000 \
+        -m connmark --mark "$_setup_fwmark" \
         -j CONNMARK --restore-mark --nfmask 0x7e0000
     echo "  Mangle     : RETURN port 5060 to $VOIP_DEST_SUBNET (no mark = no route for LAN)"
     echo "  Mangle     : MARK+CONNMARK other traffic to $VOIP_DEST_SUBNET (RTP)"
@@ -652,35 +879,6 @@ _routing_setup_b2bua() {
     echo "  FW ACCEPT  : UBIOS_LAN_IN_USER dst $VOIP_DEST_SUBNET (RTP)"
 }
 
-_routing_teardown_b2bua() {
-    local subnet voip_ip
-    subnet=$(cat  "$VOIP_STATE_DIR/subnet"  2>/dev/null || echo "10.0.0.0/8")
-    voip_ip=$(cat "$VOIP_STATE_DIR/voip_ip" 2>/dev/null || echo "")
-
-    _b2bua_stop
-
-    [ -n "$voip_ip" ] && \
-        ip rule del from "$voip_ip" priority 100       2>/dev/null || true
-    ip rule del fwmark 0x1e0000/0x7e0000 lookup "$VOIP_RT_TABLE" priority 101 2>/dev/null || true
-    ip route flush table "$VOIP_RT_TABLE"               2>/dev/null || true
-
-    iptables -t mangle -D PREROUTING \
-        -d "$subnet" -p udp --dport 5060 -j RETURN 2>/dev/null || true
-    iptables -t mangle -D PREROUTING \
-        -d "$subnet" -p tcp --dport 5060 -j RETURN 2>/dev/null || true
-    iptables -t mangle -D PREROUTING \
-        -d "$subnet" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null || true
-    iptables -t mangle -D PREROUTING \
-        -d "$subnet" -j CONNMARK --save-mark --nfmask 0x7e0000 2>/dev/null || true
-    iptables -t mangle -D PREROUTING \
-        -m connmark --mark 0x1e0000/0x7e0000 \
-        -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null || true
-    iptables -t nat -D "$UBIOS_NAT_CHAIN" \
-        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE 2>/dev/null || true
-
-    iptables -D UBIOS_LAN_IN_USER -d "$subnet" -j ACCEPT 2>/dev/null || true
-    sed -i "/^$VOIP_RT_TABLE /d" /etc/iproute2/rt_tables 2>/dev/null || true
-}
 
 # ── Routing dispatcher ────────────────────────────────────────────────────────
 
@@ -692,9 +890,10 @@ _routing_setup() {
     echo "Setting up VoIP routing"
     _detect_voip_config || return 1
     case "$ROUTING_MODE" in
-        pbr)     _routing_setup_pbr     || return 1 ;;
-        forward) _routing_setup_forward || return 1 ;;
-        b2bua)   _routing_setup_b2bua   || return 1 ;;
+        pbr)          _routing_setup_pbr          || return 1 ;;
+        forward)      _routing_setup_forward      || return 1 ;;
+        b2bua)        _routing_setup_b2bua        || return 1 ;;
+        b2bua_netns)  _routing_setup_b2bua_netns  || return 1 ;;
         *) echo "ERROR: unknown ROUTING_MODE '$ROUTING_MODE'"; return 1 ;;
     esac
     if [ "$fresh" = "true" ]; then
@@ -708,13 +907,160 @@ _routing_setup() {
 }
 
 _routing_teardown() {
+    # Universal teardown — removes every rule, route, and artifact from every
+    # routing mode.  All operations are idempotent (2>/dev/null || true), so
+    # calling this regardless of which mode was previously active is safe.
     echo "Removing VoIP routing"
-    case "$ROUTING_MODE" in
-        pbr)     _routing_teardown_pbr     ;;
-        forward) _routing_teardown_forward ;;
-        b2bua)   _routing_teardown_b2bua   ;;
-    esac
+    local _td_fwmark _td_subnet _td_voip_ip _td_port
+    _td_fwmark=$(cat  "$VOIP_STATE_DIR/fwmark"  2>/dev/null || echo "0x1e0000/0x7e0000")
+    _td_subnet=$(cat  "$VOIP_STATE_DIR/subnet"  2>/dev/null || echo "${VOIP_DEST_SUBNET:-10.0.0.0/8}")
+    _td_voip_ip=$(cat "$VOIP_STATE_DIR/voip_ip" 2>/dev/null || echo "")
+    _td_port="${VOIP_B2BUA_LISTEN_PORT:-5060}"
+
+    # ── Stop B2BUA process if running ──────────────────────────────────────
+    if [ -f "$VOIP_STATE_DIR/b2bua_pid" ]; then
+        kill "$(cat $VOIP_STATE_DIR/b2bua_pid)" 2>/dev/null || true
+        sleep 1
+        rm -f "$VOIP_STATE_DIR/b2bua_pid" "$VOIP_STATE_DIR/b2bua_status"
+    fi
+
+    # ── ip rules (all priorities, all modes) ───────────────────────────────
+    ip rule del priority 98  2>/dev/null || true          # legacy netns fwmark
+    ip rule del priority 99  2>/dev/null || true
+    while ip rule del priority 100 2>/dev/null; do :; done
+    while ip rule del priority 101 2>/dev/null; do :; done
+    ip rule del fwmark "$_td_fwmark"       lookup "$VOIP_RT_TABLE" 2>/dev/null || true
+    ip rule del fwmark 0x1e0000/0x7e0000   lookup "$VOIP_RT_TABLE" 2>/dev/null || true
+    ip rule del fwmark 0x1e0000/0x1e0000   lookup "$VOIP_RT_TABLE" 2>/dev/null || true
+
+    # ── Routing table + rt_tables entry ────────────────────────────────────
+    ip route flush table "$VOIP_RT_TABLE"                  2>/dev/null || true
+    sed -i "/^$VOIP_RT_TABLE /d" /etc/iproute2/rt_tables  2>/dev/null || true
+
+    # ── Main-table routes (b2bua_netns LAN RTP route, forward mode route) ──
+    ip route del "$_td_subnet"                             2>/dev/null || true
+    ip route del 172.31.255.0/30 dev b2bua_v0             2>/dev/null || true
+
+    # ── Netns / veth (b2bua_netns) ─────────────────────────────────────────
+    ip link del b2bua_v0                                   2>/dev/null || true
+    ip netns del b2bua_ns                                  2>/dev/null || true
+
+    # ── mangle MARK / CONNMARK (pbr, b2bua) ───────────────────────────────
+    while iptables -t mangle -D PREROUTING \
+        -d "$_td_subnet" -j MARK --set-xmark "$_td_fwmark" 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING \
+        -d "$_td_subnet" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING \
+        -d "$_td_subnet" -j CONNMARK --save-mark --nfmask 0x7e0000 2>/dev/null; do :; done
+
+    # Legacy cleanup: earlier forward-mode versions added per-interface
+    # iif-restricted MARK/CONNMARK mangle rules.  The current implementation
+    # no longer uses these (see _routing_setup_forward), but this cleanup
+    # remains so routers upgrading from an older version start with a clean
+    # mangle table.
+    local _td_fwd_iface
+    _td_fwd_iface=$(cat "$VOIP_STATE_DIR/forward_iface" 2>/dev/null || echo "$VOIP_FORWARD_INTERFACE")
+    for _iface in $_td_fwd_iface; do
+        while iptables -t mangle -D PREROUTING \
+            -i "$_iface" -d "$_td_subnet" \
+            -j MARK --set-xmark "$_td_fwmark" 2>/dev/null; do :; done
+        while iptables -t mangle -D PREROUTING \
+            -i "$_iface" -d "$_td_subnet" \
+            -j CONNMARK --save-mark --nfmask 0x7e0000 2>/dev/null; do :; done
+    done
+    while iptables -t mangle -D PREROUTING \
+        -m connmark --mark "$_td_fwmark" \
+        -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null; do :; done
+    while iptables -t mangle -D PREROUTING \
+        -m connmark --mark 0x1e0000/0x7e0000 \
+        -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null; do :; done
+
+    # ── mangle RETURN (b2bua — blocks direct LAN SIP) ──────────────────────
+    for _proto in udp tcp; do
+        while iptables -t mangle -D PREROUTING \
+            -d "$_td_subnet" -p "$_proto" --dport "$_td_port" \
+            -j RETURN 2>/dev/null; do :; done
+    done
+
+    # ── nat DNAT (b2bua_netns) — current and legacy variants ───────────────
+    for _proto in udp tcp; do
+        for _i in 1 2 3; do
+            iptables -t nat -D PREROUTING ! -i b2bua_v0 \
+                -p "$_proto" --dport "$_td_port" \
+                -m addrtype --dst-type LOCAL \
+                -j DNAT --to-destination 172.31.255.2  2>/dev/null || true
+            iptables -t nat -D PREROUTING \
+                -p "$_proto" --dport "$_td_port" \
+                -m addrtype --dst-type LOCAL \
+                -j DNAT --to-destination 172.31.255.2  2>/dev/null || true
+        done
+    done
+    for _i in 1 2 3; do
+        iptables -t nat -D PREROUTING -i "$VOIP_WAN_VLAN_INTERFACE" \
+            -p udp --dport "$_td_port" \
+            -j DNAT --to-destination 172.31.255.2      2>/dev/null || true
+        iptables -t nat -D PREROUTING \
+            -p udp --dport "$_td_port" \
+            -j DNAT --to-destination 172.31.255.2      2>/dev/null || true
+    done
+
+    # ── nat MASQUERADE / SNAT ──────────────────────────────────────────────
+    while iptables -t nat -D "$UBIOS_NAT_CHAIN" \
+        -o "$VOIP_WAN_VLAN_INTERFACE" -j MASQUERADE 2>/dev/null; do :; done
+    # forward mode: MASQUERADE was on VOIP_FORWARD_INTERFACE, not the voip vlan
+    if [ -n "$VOIP_FORWARD_INTERFACE" ]; then
+        while iptables -t nat -D "$UBIOS_NAT_CHAIN" \
+            -o "$VOIP_FORWARD_INTERFACE" -d "$_td_subnet" \
+            -j MASQUERADE 2>/dev/null; do :; done
+    fi
+    for _i in 1 2 3; do
+        iptables -t nat -D "$UBIOS_NAT_CHAIN" \
+            -s 172.31.255.2 ! -o "$VOIP_WAN_VLAN_INTERFACE" \
+            -j MASQUERADE                              2>/dev/null || true
+        iptables -t nat -D POSTROUTING \
+            -s 172.31.255.2 -j MASQUERADE             2>/dev/null || true
+        iptables -t nat -D POSTROUTING \
+            -s 172.31.255.2 -o "$VOIP_WAN_VLAN_INTERFACE" \
+            -j SNAT --to-source "$_td_voip_ip"        2>/dev/null || true
+    done
+
+    # ── FORWARD accept/drop (b2bua_netns) ─────────────────────────────────
+    for _i in 1 2 3; do
+        iptables -D FORWARD -i b2bua_v0 -j ACCEPT     2>/dev/null || true
+        iptables -D FORWARD -o b2bua_v0 -j ACCEPT     2>/dev/null || true
+        for _proto in udp tcp; do
+            iptables -D FORWARD ! -i b2bua_v0 -d "$VOIP_DEST_SUBNET" \
+                -p "$_proto" --dport "$_td_port" -j DROP 2>/dev/null || true
+            iptables -D FORWARD ! -i b2bua_v0 -d "$_td_subnet" \
+                -p "$_proto" --dport "$_td_port" -j DROP 2>/dev/null || true
+            iptables -D FORWARD -d "$_td_subnet" \
+                -p "$_proto" --dport "$_td_port" -j DROP 2>/dev/null || true
+        done
+    done
+
+    # ── raw CT notrack (legacy b2bua_netns) ────────────────────────────────
+    iptables -t raw -D PREROUTING \
+        -p udp --dport "$_td_port" -j CT --notrack    2>/dev/null || true
+
+    # ── UBIOS_LAN_IN_USER accept rules ─────────────────────────────────────
+    while iptables -D UBIOS_LAN_IN_USER \
+        -d "$_td_subnet" -j ACCEPT 2>/dev/null; do :; done
+    while iptables -D UBIOS_LAN_IN_USER \
+        -d 172.31.255.2 -j ACCEPT 2>/dev/null; do :; done
+
     ip route flush cache 2>/dev/null || true
+
+    # Flush stale conntrack entries for the B2BUA port.
+    # Stale entries from a previous mode (carrying wrong NAT state or marks set
+    # by earlier mangle rules) persist across mode switches and keep being
+    # refreshed by client retransmissions, preventing the new DNAT rules from
+    # ever establishing fresh conntrack state.  This is the root cause of the
+    # "works after a few hours" symptom — entries finally expire on their own.
+    local _ct_port="${VOIP_B2BUA_LISTEN_PORT:-5060}"
+    conntrack -D -p udp --dport "$_ct_port" 2>/dev/null || true
+    conntrack -D -p tcp --dport "$_ct_port" 2>/dev/null || true
+    conntrack -D -p udp --sport "$_ct_port" 2>/dev/null || true
+    conntrack -D -p tcp --sport "$_ct_port" 2>/dev/null || true
 }
 
 # ── P-CSCF resolution ─────────────────────────────────────────────────────────
@@ -769,6 +1115,12 @@ _show_status() {
             b2bua_clients=$(grep "^local_clients=" "$VOIP_STATE_DIR/b2bua_status" 2>/dev/null | cut -d= -f2)
             mode_info="B2BUA | upstream: ${b2bua_reg:-starting} | clients: ${b2bua_clients:-(none)}"
             ;;
+        b2bua_netns)
+            local b2bua_reg b2bua_clients
+            b2bua_reg=$(grep "^upstream_registered=" "$VOIP_STATE_DIR/b2bua_status" 2>/dev/null | cut -d= -f2)
+            b2bua_clients=$(grep "^local_clients=" "$VOIP_STATE_DIR/b2bua_status" 2>/dev/null | cut -d= -f2)
+            mode_info="B2BUA NETNS | upstream: ${b2bua_reg:-starting} | clients: ${b2bua_clients:-(none)}"
+            ;;
         *)       mode_info="$ROUTING_MODE" ;;
     esac
 
@@ -789,7 +1141,7 @@ _show_status() {
     elif [ "$pcscf_ip" = "(unresolved)" ]; then
         echo "  SIP Proxy : NOT RESOLVED -- check DNS via $VOIP_WAN_VLAN_INTERFACE"
     else
-        if [ "$ROUTING_MODE" = "b2bua" ]; then
+        if [ "$ROUTING_MODE" = "b2bua" ] || [ "$ROUTING_MODE" = "b2bua_netns" ]; then
             echo "  SIP Proxy : $pcscf_ip  (upstream, used by B2BUA)"
             _gw_ip=$(ip -o -4 addr show dev br0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
             _gw_ip="${_gw_ip:-$(ip -o -4 addr show scope global 2>/dev/null | awk '!/lo/{print $4}' | cut -d/ -f1 | head -1)}"
@@ -817,6 +1169,11 @@ _network_setup() {
     conntrack -D --orig-dst "$flush_subnet" 2>/dev/null || true
     conntrack -D --reply-dst "$flush_subnet" 2>/dev/null || true
     ip route flush cache 2>/dev/null || true
+
+    # Universal teardown: clear ALL routing rules/routes/netns from any
+    # previously active mode before bringing up a fresh configuration.
+    # This ensures mode switches never leave stale rules that break the new mode.
+    _routing_teardown
 
     if [ -e "/sys/class/net/$VOIP_WAN_VLAN_INTERFACE" ]; then
         echo "$VOIP_WAN_VLAN_INTERFACE already exists, removing first"
@@ -853,7 +1210,7 @@ _rules_ensure() {
     if ! mkdir "$_lock" 2>/dev/null; then return 0; fi
     trap 'rm -rf "$_lock"' EXIT INT TERM
 
-    if [ "$mode" = "pbr" ] || [ "$mode" = "b2bua" ]; then
+    if [ "$mode" = "pbr" ] || [ "$mode" = "b2bua" ] || [ "$mode" = "b2bua_netns" ] || [ "$mode" = "forward" ]; then
         iptables -t nat -C "$UBIOS_NAT_CHAIN" \
             -o "$iface" -j MASQUERADE 2>/dev/null \
         || { iptables -t nat -A "$UBIOS_NAT_CHAIN" -o "$iface" -j MASQUERADE
@@ -867,7 +1224,7 @@ _rules_ensure() {
 
     # Watchdog only maintains what we actually set:
     #   - NAT MASQUERADE (all modes)
-    #   - UBIOS_LAN_IN_USER dst $subnet (allows LAN→IMS through zone firewall)
+    #   - UBIOS_LAN_IN_USER dst $subnet (allows LAN→IMS traffic)
     #   - mangle MARK/CONNMARK (pbr and b2bua modes)
     # Raw FORWARD rules are NOT maintained — LAN and VPN traffic is allowed via
     # UniFi's own UBIOS_LAN_IN_USER and UBIOS_VPN_WAN_USER chains respectively.
@@ -880,29 +1237,49 @@ _rules_ensure() {
          echo "  [watchdog] restored UBIOS_LAN_IN_USER ACCEPT dst $subnet"; }
 
     if [ "$mode" = "pbr" ] || [ "$mode" = "b2bua" ]; then
+        local _wd_fwmark
+        _wd_fwmark=$(iptables -t mangle -L PREROUTING -n 2>/dev/null \
+            | awk '/MARK xset/{match($0,/0x[0-9a-f]+\/0x[0-9a-f]+/); \
+                   if(RSTART){print substr($0,RSTART,RLENGTH); exit}}')
+        [ -z "$_wd_fwmark" ] && \
+            _wd_fwmark=$(cat "$VOIP_STATE_DIR/fwmark" 2>/dev/null || echo "0x1e0000/0x7e0000")
+        [ -n "$_wd_fwmark" ] && echo "$_wd_fwmark" > "$VOIP_STATE_DIR/fwmark"
         iptables -t mangle -C PREROUTING \
-            -d "$subnet" -j MARK --set-xmark 0x1e0000/0x7e0000 2>/dev/null \
+            -d "$subnet" -j MARK --set-xmark "$_wd_fwmark" 2>/dev/null \
         || { iptables -t mangle -I PREROUTING 1 \
-                 -d "$subnet" -j MARK --set-xmark 0x1e0000/0x7e0000
+                 -d "$subnet" -j MARK --set-xmark "$_wd_fwmark"
              iptables -t mangle -I PREROUTING 2 \
                  -d "$subnet" -j CONNMARK --save-mark --nfmask 0x7e0000
              echo "  [watchdog] restored mangle MARK/CONNMARK for $subnet"; }
-        # Always ensure CONNMARK restore rule — this is the key fix for mid-call
-        # audio muting: reply packets from the IMS regain their routing mark
-        # from conntrack even if the MARK rule was briefly missing.
         iptables -t mangle -C PREROUTING \
-            -m connmark --mark 0x1e0000/0x7e0000 \
+            -m connmark --mark "$_wd_fwmark" \
             -j CONNMARK --restore-mark --nfmask 0x7e0000 2>/dev/null \
         || { iptables -t mangle -I PREROUTING 3 \
-                 -m connmark --mark 0x1e0000/0x7e0000 \
+                 -m connmark --mark "$_wd_fwmark" \
                  -j CONNMARK --restore-mark --nfmask 0x7e0000
              echo "  [watchdog] restored mangle CONNMARK restore for $subnet"; }
-        if [ "$mode" = "b2bua" ] && [ -f "$VOIP_STATE_DIR/b2bua_pid" ]; then
+    elif [ "$mode" = "forward" ]; then
+        local _wd_fwd_ifaces
+        _wd_fwd_ifaces=$(cat "$VOIP_STATE_DIR/forward_iface" 2>/dev/null || echo "$VOIP_FORWARD_INTERFACE")
+        # Routing is selected via per-interface "iif <iface> to <subnet>" rules
+        # (no mangle/fwmark — see _routing_setup_forward for why).
+        for _wd_iface in $_wd_fwd_ifaces; do
+            ip rule show 2>/dev/null \
+                | grep -qE "to $subnet iif $_wd_iface lookup" \
+            || { ip rule add iif "$_wd_iface" to "$subnet" lookup "$VOIP_RT_TABLE" priority 101
+                 echo "  [watchdog] restored ip rule: iif $_wd_iface to $subnet -> table $VOIP_RT_TABLE"; }
+        done
+    fi
+        if [ "$mode" = "b2bua" ] || [ "$mode" = "b2bua_netns" ] && [ -f "$VOIP_STATE_DIR/b2bua_pid" ]; then
             local _bpid
             _bpid=$(cat "$VOIP_STATE_DIR/b2bua_pid")
             if ! kill -0 "$_bpid" 2>/dev/null; then
                 echo "  [watchdog] B2BUA process died, restarting..."
-                _b2bua_start
+                if [ "$mode" = "b2bua_netns" ]; then
+                    _b2bua_netns_start
+                else
+                    _b2bua_start
+                fi
             fi
         fi
         if [ "$mode" = "b2bua" ]; then
@@ -916,6 +1293,17 @@ _rules_ensure() {
                      echo "  [watchdog] restored mangle RETURN ($_proto:5060 → $subnet)"; }
             done
         fi
+
+    # b2bua_netns: ensure the veth FORWARD rules stay in place.
+    # Without these, b2bua responses exit the netns via b2bua_v0 but are
+    # silently dropped by the FORWARD chain before reaching LAN clients.
+    if [ "$mode" = "b2bua_netns" ]; then
+        iptables -C FORWARD -i b2bua_v0 -j ACCEPT 2>/dev/null \
+        || { iptables -I FORWARD 1 -i b2bua_v0 -j ACCEPT
+             echo "  [watchdog] restored FORWARD -i b2bua_v0 ACCEPT"; }
+        iptables -C FORWARD -o b2bua_v0 -j ACCEPT 2>/dev/null \
+        || { iptables -I FORWARD 1 -o b2bua_v0 -j ACCEPT
+             echo "  [watchdog] restored FORWARD -o b2bua_v0 ACCEPT"; }
     fi
 
     rm -rf "$_lock"
@@ -931,7 +1319,9 @@ case $1 in
         mkdir -p "$VOIP_STATE_DIR"
         _network_setup || { echo "FATAL: network setup failed"; exit 1; }
         _resolve_pcscf
-        if [ "$ROUTING_MODE" = "b2bua" ]; then
+        if [ "$ROUTING_MODE" = "b2bua_netns" ]; then
+            _b2bua_netns_start || echo "WARNING: B2BUA failed to start — check config"
+        elif [ "$ROUTING_MODE" = "b2bua" ]; then
             _b2bua_start || echo "WARNING: B2BUA failed to start — check config"
         fi
         _show_status
@@ -965,9 +1355,12 @@ case $1 in
                             conntrack -D --orig-dst "${VOIP_IMS_SUBNET:-10.0.0.0/8}" 2>/dev/null || true
                             conntrack -D --reply-dst "${VOIP_IMS_SUBNET:-10.0.0.0/8}" 2>/dev/null || true
                             _network_setup || { echo "[ip-monitor] ERROR: setup failed"; continue; }
-                            if [ "$ROUTING_MODE" = "b2bua" ]; then
+                            if [ "$ROUTING_MODE" = "b2bua_netns" ]; then
                                 _resolve_pcscf
-                                _b2bua_start
+                                _b2bua_netns_stop; _b2bua_netns_start
+                            elif [ "$ROUTING_MODE" = "b2bua" ]; then
+                                _resolve_pcscf
+                                _b2bua_stop; _b2bua_start
                             fi
                             sleep 3
                             _rules_ensure \
@@ -997,16 +1390,16 @@ case $1 in
                    ! echo "$_evt" | grep -q "Deleted"; then
                     sleep 2
                     if ! ip route show table "$VOIP_RT_TABLE" 2>/dev/null | grep -q .; then
-                        echo "[ip-monitor] table $VOIP_RT_TABLE empty — restoring routing after eth4 toggle"
+                        echo "[ip-monitor] table $VOIP_RT_TABLE empty — restoring routing"
                         _routing_setup "false" \
                             && echo "[ip-monitor] routing restored (table $VOIP_RT_TABLE OK)" \
                             || echo "[ip-monitor] ERROR: routing restore failed"
-                        if [ "$ROUTING_MODE" = "b2bua" ]; then
+                        if [ "$ROUTING_MODE" = "b2bua_netns" ]; then
+                            _b2bua_netns_stop; _b2bua_netns_start
+                        elif [ "$ROUTING_MODE" = "b2bua" ]; then
                             _b2bua_stop; _b2bua_start
                         fi
                         sleep 3
-                    else
-                        echo "[ip-monitor] voip address event — re-ensuring rules"
                     fi
                     _rules_ensure \
                         "$VOIP_WAN_VLAN_INTERFACE" \
@@ -1022,24 +1415,30 @@ case $1 in
         while true; do
             sleep 5
             _rules_ensure \
-                "$([ "$ROUTING_MODE" = "forward" ] \
-                    && { cat "$VOIP_STATE_DIR/forward_iface" 2>/dev/null || echo "$VOIP_FORWARD_INTERFACE"; } \
-                    || echo "$VOIP_WAN_VLAN_INTERFACE")" \
+                "$VOIP_WAN_VLAN_INTERFACE" \
                 "$(cat "$VOIP_STATE_DIR/subnet" 2>/dev/null \
                     || echo "${VOIP_IMS_SUBNET:-10.0.0.0/8}")" \
                 "$ROUTING_MODE"
         done
         ;;
     stop)
+        # Kill the ip-monitor subshell AND its child (ip monitor process).
+        # A simple kill only kills the subshell; ip monitor is a grandchild
+        # and survives, showing up in systemd as a lingering unit process.
         if [ -f "$VOIP_STATE_DIR/monitor_pid" ]; then
-            kill "$(cat $VOIP_STATE_DIR/monitor_pid)" 2>/dev/null || true
+            _mpid=$(cat "$VOIP_STATE_DIR/monitor_pid")
+            # Kill the entire process group to catch ip monitor child
+            kill -- -"$_mpid" 2>/dev/null || kill "$_mpid" 2>/dev/null || true
             rm -f "$VOIP_STATE_DIR/monitor_pid"
         fi
         _network_teardown
-        rm -f "$VOIP_STATE_DIR/subnet"  "$VOIP_STATE_DIR/voip_ip" \
-              "$VOIP_STATE_DIR/gw"      "$VOIP_STATE_DIR/pcscf_ip" \
-              "$VOIP_STATE_DIR/forward_iface" "$VOIP_STATE_DIR/link_state" \
-              "$VOIP_STATE_DIR/b2bua_pid" "$VOIP_STATE_DIR/b2bua_status"
+        # Preserve the resolved subnet — it is read by _detect_voip_config
+        # on the next start to skip DNS re-resolution (cache).  Removing it
+        # here forces a fresh DNS lookup on every restart, which can fail.
+        rm -f "$VOIP_STATE_DIR/voip_ip"     "$VOIP_STATE_DIR/gw" \
+              "$VOIP_STATE_DIR/pcscf_ip"    "$VOIP_STATE_DIR/forward_iface" \
+              "$VOIP_STATE_DIR/link_state"  "$VOIP_STATE_DIR/b2bua_pid" \
+              "$VOIP_STATE_DIR/b2bua_status"
         echo "VoIP service stopped"
         ;;
     status)

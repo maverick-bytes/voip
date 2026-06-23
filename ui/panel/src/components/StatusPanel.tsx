@@ -1,6 +1,6 @@
 import { useEffect, useState, useCallback } from "react";
 import { Activity, Wifi, Globe, Router, Shield, Phone, Loader2 } from "lucide-react";
-import { postJson } from "@/lib/api";
+import { postJson, apiFetch } from "@/lib/api";
 
 interface StatusData {
   serviceRunning: boolean; interface: string; vlan: string; wanInterface: string;
@@ -8,6 +8,15 @@ interface StatusData {
   imsSubnet: string; natRule: string; sipProxy: string; uptime: string;
   b2buaRegistered?: string | null; b2buaClients?: string | null; b2buaListenPort?: string;
 }
+
+const ROUTING_LABELS: Record<string, string> = {
+  b2bua_netns: "B2BUA NETNS",
+  b2bua:       "B2BUA",
+  pbr:         "PBR",
+  forward:     "FORWARD",
+};
+
+const isB2bua = (mode: string) => mode === "b2bua" || mode === "b2bua_netns";
 
 const StatusPanel = () => {
   const [status, setStatus] = useState<StatusData | null>(null);
@@ -17,7 +26,7 @@ const StatusPanel = () => {
 
   const fetchStatus = useCallback(async () => {
     try {
-      const res = await fetch("/voip/api/status");
+      const res = await apiFetch("/voip/api/status");
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       setStatus(await res.json());
     } catch (e) {
@@ -63,6 +72,15 @@ const StatusPanel = () => {
   );
 
   const s = status;
+  const modeLabel = ROUTING_LABELS[s.routingMode] ?? s.routingMode.toUpperCase();
+  const routingDisplay = s.routingMode === "b2bua_netns"
+    ? `B2BUA NETNS → Table ${s.routingTable}`
+    : s.routingMode === "b2bua"
+    ? `B2BUA → Table ${s.routingTable}`
+    : s.routingMode === "pbr"
+    ? `PBR → Table ${s.routingTable}`
+    : `FORWARD`;
+
   return (
     <div className="space-y-5">
       {/* Service Status Banner */}
@@ -122,55 +140,75 @@ const StatusPanel = () => {
           value={`${s.interface || "voip"} (VLAN ${s.vlan} on ${s.wanInterface})`} />
         <InfoCard icon={<Globe className="w-4 h-4" />} label="VoIP IP"    value={s.voipIp || "—"} />
         <InfoCard icon={<Router className="w-4 h-4" />} label="Gateway"   value={s.gateway || "—"} />
-        <InfoCard icon={<Shield className="w-4 h-4" />} label="Routing"
-          value={`${s.routingMode} → table ${s.routingTable}`} />
+        <InfoCard icon={<Shield className="w-4 h-4" />} label="Routing"   value={routingDisplay} />
         <InfoCard icon={<Globe className="w-4 h-4" />} label="IMS Subnet" value={s.imsSubnet || "—"} />
-        <InfoCard icon={<Shield className="w-4 h-4" />} label="NAT"        value={s.natRule} small />
+        <InfoCard icon={<Shield className="w-4 h-4" />} label="NAT"       value={s.natRule} small />
       </div>
 
-      {/* SIP Proxy / B2BUA endpoint */}
-      <div className="unifi-card border-primary/30 bg-primary/5">
-        <div className="unifi-card-body flex items-center gap-3">
-          <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center">
-            <Phone className="w-5 h-5 text-primary" />
-          </div>
-          <div>
-            {s.routingMode === "B2BUA" ? (
-              <>
-                <p className="text-xs text-muted-foreground font-medium uppercase tracking-wide">SIP Registrar (B2BUA)</p>
-                <p className="text-lg font-mono font-semibold text-card-foreground">
-                  {s.sipProxy || "Resolving…"}
-                </p>
-                <p className="text-xs text-muted-foreground">Register your SIP client to this gateway address</p>
-              </>
-            ) : (
-              <>
-                <p className="text-xs text-muted-foreground font-medium uppercase tracking-wide">SIP Proxy</p>
-                <p className="text-lg font-mono font-semibold text-card-foreground">
-                  {s.sipProxy && s.sipProxy !== "(unresolved)" ? s.sipProxy : "Not resolved yet"}
-                </p>
-                <p className="text-xs text-muted-foreground">Use this address in your SIP client / ATA</p>
-              </>
-            )}
+      {/* SIP endpoint card — B2BUA / B2BUA NETNS */}
+      {isB2bua(s.routingMode) && (
+        <div className="unifi-card border-primary/30 bg-primary/5">
+          <div className="unifi-card-body flex items-center gap-3">
+            <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center">
+              <Phone className="w-5 h-5 text-primary" />
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground font-medium uppercase tracking-wide">
+                SIP Registrar — {s.routingMode === "b2bua_netns" ? "B2BUA NETNS" : "B2BUA"}
+              </p>
+              <p className="text-lg font-mono font-semibold text-card-foreground">
+                {s.sipProxy || "Resolving…"}
+              </p>
+              <p className="text-xs text-muted-foreground">
+                {s.routingMode === "b2bua_netns"
+                  ? "Register your SIP client to this address — the sandboxed B2BUA handles upstream IMS registration"
+                  : "Register your SIP client to this gateway address"}
+              </p>
+            </div>
           </div>
         </div>
-      </div>
+      )}
 
-      {/* B2BUA upstream status — only shown in b2bua mode */}
-      {s.routingMode === "B2BUA" && (
+      {/* SIP endpoint card — PBR / Forward */}
+      {!isB2bua(s.routingMode) && (
+        <div className="unifi-card border-primary/30 bg-primary/5">
+          <div className="unifi-card-body flex items-center gap-3">
+            <div className="w-10 h-10 rounded-full bg-primary/10 flex items-center justify-center">
+              <Phone className="w-5 h-5 text-primary" />
+            </div>
+            <div>
+              <p className="text-xs text-muted-foreground font-medium uppercase tracking-wide">SIP Proxy (P-CSCF)</p>
+              <p className="text-lg font-mono font-semibold text-card-foreground">
+                {s.sipProxy && s.sipProxy !== "(unresolved)" ? s.sipProxy : "Not resolved yet"}
+              </p>
+              <p className="text-xs text-muted-foreground">Configure this address in your SIP client or ATA</p>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* B2BUA status block — shown for b2bua and b2bua_netns */}
+      {isB2bua(s.routingMode) && (
         <div className="unifi-card">
           <div className="unifi-card-header">
-            <h3 className="text-sm font-semibold text-card-foreground">B2BUA Status</h3>
+            <h3 className="text-sm font-semibold text-card-foreground">
+              {s.routingMode === "b2bua_netns" ? "B2BUA NETNS Status" : "B2BUA Status"}
+            </h3>
           </div>
           <div className="grid grid-cols-1 md:grid-cols-2 gap-4 unifi-card-body">
             <InfoCard icon={<Shield className="w-4 h-4" />} label="Upstream Registration"
               value={
-                s.b2buaRegistered === "True"  ? "✓ Registered" :
+                s.b2buaRegistered === "True"  ? "✓ Registered to IMS" :
                 s.b2buaRegistered === "False" ? "✗ Not registered" :
                 "Starting…"
               } />
             <InfoCard icon={<Phone className="w-4 h-4" />} label="Local Clients"
               value={s.b2buaClients || "None registered"} />
+            {s.routingMode === "b2bua_netns" && (
+              <InfoCard icon={<Shield className="w-4 h-4" />} label="Sandbox"
+                value="Active — traffic via veth/netns through FORWARD chain"
+                small className="md:col-span-2" />
+            )}
           </div>
         </div>
       )}
@@ -178,10 +216,10 @@ const StatusPanel = () => {
   );
 };
 
-const InfoCard = ({ icon, label, value, small }: {
-  icon: React.ReactNode; label: string; value: string; small?: boolean;
+const InfoCard = ({ icon, label, value, small, className }: {
+  icon: React.ReactNode; label: string; value: string; small?: boolean; className?: string;
 }) => (
-  <div className="unifi-card">
+  <div className={`unifi-card${className ? ` ${className}` : ""}`}>
     <div className="unifi-card-body">
       <div className="flex items-center gap-2 text-muted-foreground mb-1.5">
         {icon}

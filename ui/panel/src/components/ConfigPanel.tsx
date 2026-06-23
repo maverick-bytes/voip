@@ -3,7 +3,7 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Save, Loader2, Check, AlertCircle, AlertTriangle, X } from "lucide-react";
 import { useNetworkInterfaces } from "@/hooks/useNetworkInterfaces";
 import { Checkbox } from "@/components/ui/checkbox";
-import { postJson } from "@/lib/api";
+import { postJson, apiFetch } from "@/lib/api";
 
 // ── Confirm dialog (shown before saving) ─────────────────────────────────────
 
@@ -70,7 +70,7 @@ const ConfigPanel = () => {
   const [vpnSelectedInterfaces, setVpnSelectedInterfaces] = useState<string[]>([]);
 
   useEffect(() => {
-    fetch("/voip/api/config")
+    apiFetch("/voip/api/config")
       .then(r => r.json())
       .then((data: Config) => {
         setConfig(data);
@@ -126,7 +126,7 @@ const ConfigPanel = () => {
       const poll = setInterval(async () => {
         attempts++;
         try {
-          const s = await fetch("/voip/api/status").then(r => r.json());
+          const s = await apiFetch("/voip/api/status").then(r => r.json());
           if (s.serviceRunning) {
             clearInterval(poll);
             setSaveResult({ ok: true, msg: "Configuration saved. Service restarted." });
@@ -247,23 +247,28 @@ const ConfigPanel = () => {
 
             {/* Routing Mode */}
             <FieldGroup label="Routing Mode"
-              hint="B2BUA: local SIP proxy — LAN clients register to the gateway. PBR: dedicated routing table. Forward: route via existing VLAN interface.">
+              hint="B2BUA NETNS: sandboxed SIP proxy — traffic through ALIEN/TOR/IPS via the FORWARD chain. B2BUA: direct SIP proxy (deprecated). PBR: policy-based routing. Forward: route via existing VLAN interface.">
               <div className="flex gap-2 flex-wrap">
-                {["b2bua", "pbr", "forward"].map(mode => (
-                  <button key={mode} onClick={() => handleChange("ROUTING_MODE", mode)}
+                {[
+                  { value: "b2bua_netns", label: "B2BUA NETNS (Recommended)" },
+                  { value: "b2bua",       label: "B2BUA (Deprecated)" },
+                  { value: "pbr",         label: "PBR" },
+                  { value: "forward",     label: "FORWARD" },
+                ].map(({ value, label }) => (
+                  <button key={value} onClick={() => handleChange("ROUTING_MODE", value)}
                     className={`px-4 py-2 rounded-md text-sm font-medium transition-colors ${
-                      config.ROUTING_MODE === mode
+                      config.ROUTING_MODE === value
                         ? "bg-primary text-primary-foreground"
                         : "bg-secondary text-secondary-foreground hover:bg-accent"
                     }`}>
-                    {mode.toUpperCase()}
+                    {label}
                   </button>
                 ))}
               </div>
             </FieldGroup>
 
-            {/* B2BUA config — only in b2bua mode */}
-            {config.ROUTING_MODE === "b2bua" && (
+            {/* B2BUA config — shown for b2bua and b2bua_netns */}
+            {(config.ROUTING_MODE === "b2bua" || config.ROUTING_MODE === "b2bua_netns") && (
               <FieldGroup label="B2BUA — Upstream ISP Account"
                 hint="ISP SIP credentials the B2BUA uses to register to the IMS network on behalf of all local clients">
                 <div className="space-y-3">
@@ -305,8 +310,8 @@ const ConfigPanel = () => {
               </FieldGroup>
             )}
 
-            {/* B2BUA local account — only in b2bua mode */}
-            {config.ROUTING_MODE === "b2bua" && (
+            {/* B2BUA local account — shown for b2bua and b2bua_netns */}
+            {(config.ROUTING_MODE === "b2bua" || config.ROUTING_MODE === "b2bua_netns") && (
               <FieldGroup label="B2BUA — Local SIP Account"
                 hint="Credentials LAN clients use to register to the gateway (leave blank to allow any client without authentication)">
                 <div className="grid grid-cols-2 gap-3">
@@ -365,8 +370,8 @@ const ConfigPanel = () => {
               </FieldGroup>
             )}
 
-            {/* Routing Table — shown for pbr and b2bua (both use table 203) */}
-            {(config.ROUTING_MODE === "pbr" || config.ROUTING_MODE === "b2bua") && (
+            {/* Routing Table — shown for pbr, b2bua, and b2bua_netns */}
+            {(config.ROUTING_MODE === "pbr" || config.ROUTING_MODE === "b2bua" || config.ROUTING_MODE === "b2bua_netns") && (
               <FieldGroup label="Voip Routing Table Number"
                 hint="Auto-detected at install. Only change if you have a table conflict.">
                 <input type="text" value={config.VOIP_RT_TABLE ?? ""}
