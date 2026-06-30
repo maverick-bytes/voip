@@ -1,8 +1,8 @@
 # VoIP on UniFi OS
-
+![VoIP on UniFi OS](assets/banner.png) 
 These scripts allow you to configure VoIP service for customers who have replaced their ISP router with a Unifi gateway based on UnifiOS (Cloud Gateways (UCG-XX), Gateways (UXG-XX), Dream routers (UDM-XX), etc...).
 
-Since it is currently impossible to configure via the Unifi GUI a WAN interface with multiple VLANs, as someone would expect from such prosumer products to have, in contrast to 10$ devices and default isp ONTs.. this script creates a new interface and handles VoIP traffic routing to your local network.
+Since it is currently impossible to configure via the Unifi GUI a WAN interface with multiple VLANs, as someone would expect from such prosumer products to have, in contrast to 10$ devices and default isp ONTs.. a new interface is created with your desired VLAN ID, which handles VoIP traffic routing to your local network.
 
 Tested on **Unifi Cloud Gateway Fiber (UCG-Fiber)** with UnifiOS.
 
@@ -15,7 +15,7 @@ Tested on **Unifi Cloud Gateway Fiber (UCG-Fiber)** with UnifiOS.
 
 ## Installation
 
-As previously mentionned SSH access to the gateway is required.
+As previously mentioned, SSH access to the gateway is required.
 
 On the gateway, download this repository into the `/data/voip` directory (the `/data` content is preserved during reboots and firmware upgrades):
 ```bash
@@ -36,14 +36,15 @@ cd /data/voip
 ./voip install
 ./voip install-ui
 ```
-
+![VoIP on UniFi OS](assets/Status.png)
 You can then open **`<gateway-ip>/voip`** in your browser to configure the VoIP service using the Web UI (recommended), or manually edit the configuration file:
 ```bash
 vi /data/voip/voipd.conf
 ```
 
 A full example configuration with all available options is available in `voipd.conf.example`.
-
+![VoIP on UniFi OS](assets/Configuration_1.png)
+![VoIP on UniFi OS](assets/Configuration_2.png)
 
 ### Routing modes
 
