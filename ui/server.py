@@ -4,6 +4,7 @@ VoIP Web UI — API backend for UniFiOS
 Runs on 127.0.0.1:8099, accessed only via nginx reverse proxy at /voip
 """
 
+import hmac
 import http.server
 import json
 import re
@@ -20,6 +21,7 @@ DIST_DIR  = UI_DIR / "dist"
 CONF_FILE = BASE_DIR / "voipd.conf"
 STATE_DIR = Path("/var/run/voipd")
 TOKEN_FILE = UI_DIR / ".internal-token"
+MAX_BODY_BYTES = 65536  # cap on POST body size (config/command payloads are tiny)
 
 def _internal_token():
     """Read the shared secret nginx injects as X-Voip-Token."""
@@ -55,17 +57,92 @@ def read_conf():
             conf[key] = val
     return conf
 
+# Per-key validation patterns. voipd.conf is SOURCED by the shell daemon
+# (`. /data/voip/voipd.conf`), so any value written here is executed as root
+# when voipd (re)starts. Structured fields are format-validated below; the
+# remaining free-form fields (SIP credentials, which may legitimately contain
+# spaces and punctuation) are made safe by _shell_escape_dq() at write time.
+_CONF_VALIDATORS = {
+    # Linux interface names (single). No shell metacharacters possible.
+    "VOIP_WAN_INTERFACE":         r'^[A-Za-z0-9._-]{1,32}$',
+    "VOIP_WAN_VLAN_INTERFACE":    r'^[A-Za-z0-9._-]{1,32}$',
+    "VOIP_FORWARD_INTERFACE":     r'^[A-Za-z0-9._-]{1,32}( [A-Za-z0-9._-]{1,32})*$',
+    "VOIP_VPN_INTERFACES":        r'^[A-Za-z0-9._-]{1,32}( [A-Za-z0-9._-]{1,32})*$',
+    "VOIP_RT_TABLE_NAME":         r'^[A-Za-z0-9._-]{1,32}$',
+    # Numeric fields
+    "VOIP_WAN_VLAN":              r'^\d{1,4}$',
+    "VOIP_RT_TABLE":              r'^\d{1,5}$',
+    "VOIP_B2BUA_LISTEN_PORT":     r'^\d{1,5}$',
+    "VOIP_B2BUA_REG_EXPIRES":     r'^\d{1,6}$',
+    # DNS hostnames
+    "PCSCF_HOSTNAME":             r'^[A-Za-z0-9.-]{1,253}$',
+    "VOIP_B2BUA_DOMAIN":          r'^[A-Za-z0-9.-]{1,253}$',
+    # IP / CIDR
+    "VOIP_IMS_SUBNET":            r'^[0-9./]{0,32}$',
+    "VOIP_FORWARD_GATEWAY":       r'^[0-9.]{0,32}$',
+    # QoS map: "0:5 1:5 ..." — digits, colons, spaces
+    "VOIP_WAN_VLAN_INTERFACE_EGRESS_QOS": r'^[0-9: ]{0,64}$',
+    # Enums
+    "ROUTING_MODE":               r'^(pbr|forward|b2bua|b2bua_netns)$',
+    "VOIP_DEBUG":                 r'^(true|false)$',
+}
+
+# Characters that must never reach a sourced shell value. Free-form fields
+# (SIP user/pass) are rejected if they contain these rather than escaped,
+# because a SIP credential has no legitimate reason to contain them and
+# rejecting is safer than trying to round-trip escaping through the shell.
+_CONF_FORBIDDEN = set('"`$\\\n\r')
+
+def _conf_value_ok(key: str, val: str) -> bool:
+    pat = _CONF_VALIDATORS.get(key)
+    if pat is not None:
+        return re.match(pat, val) is not None
+    # Free-form field (credentials): allow anything except shell-dangerous chars
+    return not (_CONF_FORBIDDEN & set(val))
+
 def write_conf(data: dict):
+    # Validate every supplied value against its key's allowed format. Any
+    # value that fails validation causes the whole write to be rejected —
+    # we never write a partially-validated config that could contain an
+    # injection payload for the shell daemon that sources this file.
+    to_write = {}
+    for key in CONF_KEYS:
+        if key not in data:
+            continue
+        val = data[key]
+        if not isinstance(val, str):
+            val = str(val)
+        if not _conf_value_ok(key, val):
+            # Reject the entire request — do not write anything.
+            return False, f"Invalid value for {key}"
+        to_write[key] = val
+
     # Refuse to overwrite with an empty payload — guards against accidental wipes
-    meaningful = {k: v for k, v in data.items() if k in CONF_KEYS and v != ""}
+    meaningful = {k: v for k, v in to_write.items() if v != ""}
     if not meaningful:
-        return
+        return False, "Empty configuration payload"
+
     lines = ["# /data/voip/voipd.conf — managed by voip-ui",
              "# Edit here or via the web UI at https://<gateway>/voip", ""]
     for key in CONF_KEYS:
-        if key in data:
-            lines.append(f'{key}="{data[key]}"')
+        if key in to_write:
+            lines.append(f'{key}={_shell_escape_dq(to_write[key])}')
     CONF_FILE.write_text("\n".join(lines) + "\n")
+    return True, "OK"
+
+
+def _shell_escape_dq(val: str) -> str:
+    """
+    Return val as a safe double-quoted POSIX shell string. Backslash-escapes
+    the four characters that remain special inside double quotes: " ` $ \\.
+    Any value produced here is inert when the file is sourced, regardless of
+    content — this is the last line of defense behind _conf_value_ok().
+    """
+    escaped = (val.replace('\\', '\\\\')
+                  .replace('"', '\\"')
+                  .replace('`', '\\`')
+                  .replace('$', '\\$'))
+    return f'"{escaped}"'
 
 def read_state(name):
     f = STATE_DIR / name
@@ -527,36 +604,46 @@ def api_command(body: dict):
     if cmd not in allowed:
         return {"ok": False, "output": f"Unknown command: {cmd}"}
 
-    # Commands that restart or stop voip-ui mid-execution use deferred actions:
-    # - DEFERRED_RESTART_CMDS: run with --no-restart, then restart + nginx reload 1s later
-    # - DEFERRED_STOP_CMDS: run with --no-stop, then stop voip-ui 1s later
-    DEFERRED_RESTART_CMDS = {"update", "install-ui", "install-all"}
-    DEFERRED_STOP_CMDS    = {"uninstall-ui", "uninstall-all"}
-
     try:
         result = subprocess.run(
             allowed[cmd], shell=True, capture_output=True,
             text=True, timeout=120)
         output = (result.stdout + result.stderr).strip()
-        if cmd in DEFERRED_RESTART_CMDS:
-            import threading
-            threading.Timer(1.0, lambda: subprocess.Popen(
-                "systemctl restart voip-ui && nginx -s reload",
-                shell=True, start_new_session=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )).start()
-        elif cmd in DEFERRED_STOP_CMDS:
-            import threading
-            threading.Timer(1.0, lambda: subprocess.Popen(
-                "systemctl stop voip-ui",
-                shell=True, start_new_session=True,
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-            )).start()
-        return {"ok": result.returncode == 0, "output": output}
+        # Some commands restart or stop the voip-ui service itself, which would
+        # kill this process mid-response. We don't fire that here; instead we
+        # return the deferred action to the caller (do_POST), which runs it
+        # only AFTER the HTTP response has been flushed to the client. This
+        # removes the fixed-delay race where a slow response could be cut off
+        # by the service restart. See DEFERRED_ACTIONS below.
+        return {
+            "ok": result.returncode == 0,
+            "output": output,
+            "_deferred": DEFERRED_ACTIONS.get(cmd),
+        }
     except subprocess.TimeoutExpired:
         return {"ok": False, "output": "Command timed out after 120s"}
     except Exception as e:
         return {"ok": False, "output": str(e)}
+
+
+# Commands that restart or stop the voip-ui service itself map to a shell
+# action that must run only after the HTTP response has been sent.
+#   - update/install-ui/install-all: restart voip-ui + reload nginx
+#   - uninstall-ui/uninstall-all:    stop voip-ui
+DEFERRED_ACTIONS = {
+    "update":        "systemctl restart voip-ui && nginx -s reload",
+    "install-ui":    "systemctl restart voip-ui && nginx -s reload",
+    "install-all":   "systemctl restart voip-ui && nginx -s reload",
+    "uninstall-ui":  "systemctl stop voip-ui",
+    "uninstall-all": "systemctl stop voip-ui",
+}
+
+
+def _run_deferred(shell_action: str):
+    """Run a post-response deferred action detached from this process."""
+    subprocess.Popen(
+        shell_action, shell=True, start_new_session=True,
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 # ── HTTP handler ──────────────────────────────────────────────────────────────
 
@@ -575,7 +662,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.send_response(code)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", len(body))
-        self.send_header("Access-Control-Allow-Origin", "*")
+        # No Access-Control-Allow-Origin: the UI and API are same-origin behind
+        # the UniFi nginx proxy, so cross-origin access is never needed. A
+        # wildcard here would let any site attempt cross-origin API reads.
         self._security_headers()
         self.end_headers()
         self.wfile.write(body)
@@ -586,7 +675,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if expected is None:
             return False  # Token file missing — deny (fail closed)
         provided = self.headers.get("X-Voip-Token", "")
-        return provided == expected
+        # Constant-time compare to avoid leaking the token via response timing.
+        return hmac.compare_digest(provided, expected)
 
     def _serve_file(self, path: Path):
         if not path.exists():
@@ -606,10 +696,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_OPTIONS(self):
+        # Same-origin app: no cross-origin CORS grants are advertised. Browsers
+        # do not send a preflight for same-origin requests, so this is only a
+        # well-formed no-op response for any stray OPTIONS probe.
         self.send_response(204)
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Allow", "GET, POST, OPTIONS")
         self.end_headers()
 
     def do_GET(self):
@@ -633,10 +724,29 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path   = urllib.parse.urlparse(self.path).path.rstrip("/")
         if not self._check_api_token():
             self._json(403, {"error": "forbidden"}); return
-        length = int(self.headers.get("Content-Length", 0))
-        body   = json.loads(self.rfile.read(length)) if length else {}
+
+        # Bound the request body — config/command payloads are tiny (< 4 KB in
+        # practice). Reject anything oversized rather than buffering it.
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            self._json(400, {"error": "invalid Content-Length"}); return
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._json(413, {"error": "payload too large"}); return
+
+        # Parse the JSON body defensively — a malformed body must return a
+        # clean 400, not a 500 with a half-written response.
+        try:
+            body = json.loads(self.rfile.read(length)) if length else {}
+        except (json.JSONDecodeError, ValueError):
+            self._json(400, {"error": "invalid JSON body"}); return
+        if not isinstance(body, dict):
+            self._json(400, {"error": "body must be a JSON object"}); return
+
         if path == "/voip/api/config":
-            write_conf(body)
+            ok, msg = write_conf(body)
+            if not ok:
+                self._json(400, {"ok": False, "error": msg}); return
             subprocess.run("systemctl restart voipd", shell=True)
             self._json(200, {"ok": True})
         elif path == "/voip/api/command":
@@ -651,8 +761,22 @@ class Handler(http.server.BaseHTTPRequestHandler):
             wait = 110 if cmd in ("update", "install", "reinstall",
                                   "uninstall", "uninstall-all") else 10
             t.join(timeout=wait)
-            self._json(200, result_holder if result_holder
-                       else {"ok": True, "output": "Still running — check logs with: journalctl -u voip-ui -f"})
+            payload = result_holder if result_holder else {
+                "ok": True,
+                "output": "Still running — check logs with: journalctl -u voip-ui -f",
+            }
+            # Pull the deferred action (restart/stop voip-ui) out of the payload
+            # so it isn't serialized to the client, then run it strictly AFTER
+            # the response is flushed — otherwise restarting voip-ui here would
+            # kill this process before the client receives the reply.
+            deferred = payload.pop("_deferred", None)
+            self._json(200, payload)
+            if deferred:
+                try:
+                    self.wfile.flush()
+                except Exception:
+                    pass
+                _run_deferred(deferred)
         else:
             self._json(404, {"error": "not found"})
 

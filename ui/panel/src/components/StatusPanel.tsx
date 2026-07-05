@@ -23,6 +23,10 @@ const StatusPanel = () => {
   const [loading, setLoading] = useState(true);
   const [actionPending, setActionPending] = useState<string | null>(null);
   const [actionMsg, setActionMsg] = useState<string | null>(null);
+  // While a restart/start is settling, voipd briefly reports inactive. We
+  // suppress the red "Service Stopped" flash during this window and show a
+  // transitional "Restarting…" state instead, until the service comes back.
+  const [transition, setTransition] = useState<"restarting" | "stopping" | null>(null);
 
   const fetchStatus = useCallback(async () => {
     try {
@@ -42,18 +46,56 @@ const StatusPanel = () => {
     return () => clearInterval(id);
   }, [fetchStatus]);
 
+  // Poll the status endpoint repeatedly until it reports the expected running
+  // state (or we run out of attempts). Used after a service-control action so
+  // the badge reflects reality quickly instead of waiting for the 8s poll,
+  // and without flashing a stale "Stopped" while the service is still coming up.
+  const pollUntil = useCallback(async (
+    wantRunning: boolean,
+    attempts = 12,
+    intervalMs = 1500,
+  ) => {
+    for (let i = 0; i < attempts; i++) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+      try {
+        const res = await apiFetch("/voip/api/status");
+        if (res.ok) {
+          const data: StatusData = await res.json();
+          setStatus(data);
+          if (data.serviceRunning === wantRunning) return true;
+        }
+      } catch {
+        /* keep trying */
+      }
+    }
+    return false;
+  }, []);
+
   const runCommand = async (cmd: string, label: string) => {
     setActionPending(cmd);
     setActionMsg(null);
+    // Set the transitional state up-front so the banner never flashes red
+    // "Stopped" mid-restart.
+    if (cmd === "restart" || cmd === "start") setTransition("restarting");
+    else if (cmd === "stop") setTransition("stopping");
     try {
       const res = await postJson("/voip/api/command", { command: cmd });
       const data = await res.json();
       setActionMsg(data.ok ? `${label} succeeded.` : `Error: ${data.output}`);
-      setTimeout(fetchStatus, 2000);
+      if (data.ok) {
+        // Wait for the service to actually reach the expected state before
+        // clearing the transitional banner.
+        const wantRunning = cmd !== "stop";
+        await pollUntil(wantRunning);
+      } else {
+        await fetchStatus();
+      }
     } catch (e) {
       setActionMsg(`Network error: ${e}`);
+      await fetchStatus();
     } finally {
       setActionPending(null);
+      setTransition(null);
     }
   };
 
@@ -88,24 +130,53 @@ const StatusPanel = () => {
         <div className="unifi-card-body flex items-center justify-between">
           <div className="flex items-center gap-3">
             <div className={`w-10 h-10 rounded-full flex items-center justify-center ${
-              s.serviceRunning ? "bg-success/10" : "bg-destructive/10"
+              transition ? "bg-primary/10"
+                         : s.serviceRunning ? "bg-success/10" : "bg-destructive/10"
             }`}>
-              <Activity className={`w-5 h-5 ${s.serviceRunning ? "text-success" : "text-destructive"}`} />
+              {transition ? (
+                <Loader2 className="w-5 h-5 text-primary animate-spin" />
+              ) : (
+                <Activity className={`w-5 h-5 ${s.serviceRunning ? "text-success" : "text-destructive"}`} />
+              )}
             </div>
             <div>
               <div className="flex items-center gap-2">
-                <span className={`status-dot ${s.serviceRunning ? "status-dot-online" : "status-dot-offline"}`} />
+                <span className={`status-dot ${
+                  transition ? "status-dot-warning"
+                             : s.serviceRunning ? "status-dot-online" : "status-dot-offline"
+                }`} />
                 <span className="text-sm font-semibold text-card-foreground">
-                  {s.serviceRunning ? "Service Running" : "Service Stopped"}
+                  {transition === "restarting" ? "Restarting…"
+                    : transition === "stopping" ? "Stopping…"
+                    : s.serviceRunning ? "Service Running" : "Service Stopped"}
                 </span>
               </div>
               <p className="text-xs text-muted-foreground mt-0.5">
-                voipd.service{s.uptime ? ` • Uptime: ${s.uptime}` : ""}
+                voipd.service{!transition && s.uptime ? ` • Uptime: ${s.uptime}` : ""}
               </p>
             </div>
           </div>
           <div className="flex gap-2">
-            {s.serviceRunning ? (
+            {/* During a transition (restart/start/stop settling) keep the
+                Stop | Restart buttons in place but disabled and dimmed — the
+                stable layout plus the darkened, non-clickable controls read
+                clearly as "busy", and the animated ring in the status banner
+                already supplies the motion (so no redundant spinner in here).
+                We deliberately show Stop | Restart rather than the raw
+                serviceRunning branch, which would flip to a contradictory
+                "Start" button mid-restart. */}
+            {transition ? (
+              <>
+                <button disabled
+                  className="px-3 py-1.5 text-xs font-medium rounded-md bg-destructive/10 text-destructive opacity-40 cursor-default">
+                  Stop
+                </button>
+                <button disabled
+                  className="px-3 py-1.5 text-xs font-medium rounded-md bg-primary/10 text-primary opacity-40 cursor-default">
+                  Restart
+                </button>
+              </>
+            ) : s.serviceRunning ? (
               <>
                 <button onClick={() => runCommand("stop", "Stop")}
                   disabled={!!actionPending}
@@ -127,7 +198,10 @@ const StatusPanel = () => {
             )}
           </div>
         </div>
-        {actionMsg && (
+        {/* Suppress the success message while still transitioning — showing
+            "Restart succeeded" under a "Restarting…" banner reads as
+            contradictory. Errors are always shown immediately. */}
+        {actionMsg && (transition === null || actionMsg.startsWith("Error")) && (
           <div className={`px-5 pb-3 text-xs ${actionMsg.startsWith("Error") ? "text-destructive" : "text-success"}`}>
             {actionMsg}
           </div>

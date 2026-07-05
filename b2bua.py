@@ -5,7 +5,8 @@ Single registrar for LAN clients (both UDP and TCP transport).
 Parallel forking on inbound calls — all registered clients ring simultaneously.
 Upstream toward IMS always uses UDP.
 Supports two socket modes: dual-socket (non-netns, direct routing) and
-single-socket (netns, all traffic via veth through FORWARD chain (ALIEN/TOR + IPS) and IPS/DPI).
+single-socket (netns, all traffic via veth through the FORWARD chain, where
+ALIEN/TOR blocking and IPS apply).
 """
 import os, sys, re, time, socket, threading, hashlib, random, logging, signal
 
