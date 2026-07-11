@@ -2,7 +2,8 @@
 @tailwind components;
 @tailwind utilities;
 
-@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap');
+/* Inter is loaded via <link> in index.html — an @import here (after the
+   @tailwind directives) is invalid CSS and browsers ignore it. */
 
 @layer base {
   :root {
@@ -22,7 +23,7 @@
     --secondary-foreground: 220 20% 25%;
 
     --muted: 214 15% 95%;
-    --muted-foreground: 215 10% 50%;
+    --muted-foreground: 215 10% 45%;
 
     --accent: 214 15% 93%;
     --accent-foreground: 220 20% 10%;
@@ -30,14 +31,14 @@
     --destructive: 0 72% 51%;
     --destructive-foreground: 0 0% 100%;
 
-    --success: 142 72% 40%;
+    --success: 142 68% 38%;
     --success-foreground: 0 0% 100%;
 
-    --warning: 38 92% 50%;
+    --warning: 36 95% 44%;
     --warning-foreground: 0 0% 100%;
 
-    --border: 214 20% 90%;
-    --input: 214 20% 90%;
+    --border: 214 20% 89%;
+    --input: 214 20% 89%;
     --ring: 215 100% 50%;
 
     --radius: 0.5rem;
@@ -155,4 +156,106 @@
            focus:outline-none focus:ring-2 focus:ring-ring focus:border-transparent
            transition-colors;
   }
+}
+
+
+/* ============================================================
+   Status page — Claude Design layout helpers
+   ============================================================ */
+
+/* Info grid: 3 columns, collapsing to 2 then 1 on narrower widths. */
+.dc-g3 {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 16px;
+}
+@media (max-width: 1060px) {
+  .dc-g3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 660px) {
+  .dc-g3 { grid-template-columns: 1fr; }
+}
+
+/* Nested 2-column grid inside the B2BUA status card. */
+.dc-g2 {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px;
+}
+@media (max-width: 660px) {
+  .dc-g2 { grid-template-columns: 1fr; }
+}
+
+/* Status banner right cluster: metrics · divider · action buttons.
+   Wide: a row with a thin vertical divider between the metrics and buttons.
+   Narrow: the cluster stacks vertically and the divider becomes a full-width
+   horizontal rule, so the buttons never sit glued under the metrics.
+
+   The switch is driven by a CONTAINER query on the banner itself, not by a
+   viewport media query: the wrap point depends on the banner's own width
+   (viewport minus sidebar minus page padding), so a fixed viewport breakpoint
+   leaves a zone where the buttons wrap but the divider stays vertical. The
+   460px threshold is the worst-case width of the one-row cluster (metrics at
+   "100.0 %" + divider + gaps + Stop/Restart, ~390px content) plus the banner's
+   horizontal padding and a safety margin — the stack always engages before
+   the row could ever wrap internally. */
+.dc-banner {
+  container-type: inline-size;
+}
+.dc-banner-right {
+  display: flex;
+  align-items: center;
+  gap: 18px;
+  flex-wrap: wrap;
+}
+.dc-banner-metrics {
+  display: flex;
+  align-items: center;
+  gap: 20px;
+}
+.dc-banner-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.dc-banner-divider {
+  align-self: stretch;
+  width: 1px;
+  min-height: 40px;
+  background: hsl(var(--border));
+  flex: none;
+}
+@container (max-width: 460px) {
+  .dc-banner-right {
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+  }
+  .dc-banner-divider {
+    width: 100%;
+    height: 1px;
+    min-height: 0;
+  }
+}
+/* Fallback for browsers without container-query support: approximate the
+   same behavior with a viewport breakpoint (duplicates the declarations
+   above at small widths, which is harmless). */
+@media (max-width: 640px) {
+  .dc-banner-right {
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+  }
+  .dc-banner-divider {
+    width: 100%;
+    height: 1px;
+    min-height: 0;
+  }
+}
+
+
+/* Status dot pulse — matches the Claude Design mockup (gentle fade in/out). */
+@keyframes dotpulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
 }

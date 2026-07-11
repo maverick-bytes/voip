@@ -84,7 +84,11 @@ install_service() {
 
     systemctl daemon-reload
     systemctl enable ${SERVICE_NAME}
-    systemctl start  ${SERVICE_NAME}
+    # Use restart, not start: on a fresh install this starts the service, and
+    # on a repair/reinstall of an already-running service it actually reloads
+    # the newly-copied daemon (start would be a no-op on a running unit, so the
+    # repaired files would not take effect until the next manual restart).
+    systemctl restart ${SERVICE_NAME}
 
     echo "VoIP service installed and started."
     echo "  Status: systemctl status ${SERVICE_NAME}"
@@ -426,6 +430,16 @@ location /voip {
 }
 
 location @voip_unauth {
+    # Unauthenticated page loads are redirected to the UniFi OS root, which
+    # shows the login. After login the user lands on the UniFi dashboard and
+    # navigates to /voip. NOTE: a seamless "?redirect=/voip" was investigated
+    # and does not work — UniFi's portal SPA deliberately converts all
+    # same-origin navigation (including a post-login redirect param) to a soft
+    # in-app React Router route, so it never triggers a full page load of the
+    # /voip server route (it falls back to UniFi's own Control Plane view
+    # instead). Only different-origin URLs get a hard navigation. Once a UniFi
+    # OS session is active, visiting /voip loads this UI directly; the redirect
+    # only applies while logged out. The auth gate above is unchanged.
     return 302 https://\$host/;
 }
 LOCEOF

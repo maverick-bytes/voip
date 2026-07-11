@@ -161,26 +161,175 @@ def sh(cmd, timeout=15):
 def sh_lines(cmd, timeout=15):
     return sh(cmd, timeout).splitlines()
 
+# ── API: service metrics (CPU / memory) ───────────────────────────────────────
+
+# Cached page size and clock ticks — these never change at runtime.
+import os as _os
+_PAGE_SIZE  = _os.sysconf("SC_PAGE_SIZE")   # bytes per memory page
+_CLOCK_TICK = _os.sysconf("SC_CLK_TCK")     # scheduler ticks per second
+
+def _service_pids():
+    """
+    Return the set of PIDs that make up the whole service footprint:
+    the voipd process tree (voipd + shell children + ip monitor), the
+    sandboxed b2bua.py, and the voip-ui web backend itself.
+
+    We resolve each systemd unit's cgroup process list via
+    /sys/fs/cgroup, which is a single cheap read per unit and captures
+    all child processes without spawning ps/pgrep.
+    """
+    pids = set()
+    for unit in ("voipd", "voip-ui"):
+        # cgroup v2 path used by systemd on UniFi OS
+        for base in (f"/sys/fs/cgroup/system.slice/{unit}.service/cgroup.procs",
+                     f"/sys/fs/cgroup/systemd/system.slice/{unit}.service/cgroup.procs"):
+            try:
+                with open(base) as f:
+                    for line in f:
+                        line = line.strip()
+                        if line.isdigit():
+                            pids.add(int(line))
+                break  # first path that exists wins
+            except OSError:
+                continue
+    # b2bua.py runs inside a network namespace but is still a normal host
+    # process in the root PID namespace — include it explicitly in case it
+    # is not under either service cgroup (it is spawned by voipd). Guard
+    # against a stale pid file (e.g. after switching to pbr/forward mode
+    # without a reboot): only count the PID if it is a live b2bua process,
+    # so a recycled PID never attributes an unrelated process's CPU/RSS
+    # to the service.
+    try:
+        b2_pid = read_state("b2bua_pid")
+        if b2_pid.isdigit():
+            with open(f"/proc/{b2_pid}/cmdline", "rb") as f:
+                if b"b2bua" in f.read():
+                    pids.add(int(b2_pid))
+    except Exception:
+        pass
+    return pids
+
+def _proc_cpu_ticks(pid):
+    """Return utime+stime (in clock ticks) for a PID, or None if gone."""
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            data = f.read()
+        # Field 14 = utime, 15 = stime (1-indexed, after the comm field which
+        # may contain spaces/parens — so split on the last ')' first).
+        after = data[data.rfind(")") + 2:].split()
+        return int(after[11]) + int(after[12])   # utime + stime
+    except (OSError, ValueError, IndexError):
+        return None
+
+def _proc_rss_bytes(pid):
+    """Return resident set size in bytes for a PID, or 0 if gone."""
+    try:
+        with open(f"/proc/{pid}/statm") as f:
+            # field 2 = resident pages
+            resident = int(f.read().split()[1])
+        return resident * _PAGE_SIZE
+    except (OSError, ValueError, IndexError):
+        return 0
+
+def _service_uptime_seconds():
+    """
+    Seconds since the voipd main process started, from /proc only. Reads the
+    process starttime (field 22 of /proc/<pid>/stat, in ticks since boot) and
+    subtracts it from the system uptime. Returns None if voipd isn't running.
+    """
+    mainpid = sh("systemctl show voipd --property=MainPID --value")
+    if not mainpid.isdigit() or mainpid == "0":
+        return None
+    try:
+        with open(f"/proc/{mainpid}/stat") as f:
+            data = f.read()
+        after = data[data.rfind(")") + 2:].split()
+        starttime_ticks = int(after[19])          # field 22 overall
+        proc_start_s = starttime_ticks / _CLOCK_TICK
+        with open("/proc/uptime") as f:
+            system_uptime_s = float(f.read().split()[0])
+        return max(system_uptime_s - proc_start_s, 0.0)
+    except (OSError, ValueError, IndexError):
+        return None
+
+# CPU% is computed from the tick delta between consecutive polls (the UI polls
+# every ~8 s). A one-shot short window cannot work here: with CLK_TCK=100 one
+# kernel tick is 10 ms, so the smallest non-zero reading over a 150 ms window
+# is 10/150 = 6.7% — a light steady load such as an active RTP relay (~1-3%)
+# reads as 0.0, while idle background blips read as exactly 6.6/6.7. Averaging
+# across the poll interval gives 0.125% resolution at 8 s.
+_cpu_lock = threading.Lock()
+_cpu_last = {"ticks": None, "t": 0.0, "value": 0.0}
+
+def api_metrics():
+    """
+    CPU % and memory (MB) across the whole service footprint, computed from
+    /proc with no external process spawns. CPU is averaged over the interval
+    since the previous call (~ the UI poll period); the first call after a
+    backend start returns 0.0 while the baseline is established.
+    """
+    import time as _time
+    pids = _service_pids()
+
+    # --- CPU: tick delta since the previous poll ------------------------------
+    now = _time.monotonic()
+    ticks = sum(v for v in (_proc_cpu_ticks(p) for p in pids) if v is not None)
+
+    with _cpu_lock:
+        prev_ticks = _cpu_last["ticks"]
+        prev_t     = _cpu_last["t"]
+        prev_val   = _cpu_last["value"]
+        if prev_ticks is None:
+            cpu_pct = 0.0                    # first sample: establish baseline
+            _cpu_last.update(ticks=ticks, t=now, value=cpu_pct)
+        elif now - prev_t < 1.0:
+            cpu_pct = prev_val               # rapid re-poll: reuse last value
+        else:
+            delta = ticks - prev_ticks
+            if delta < 0:
+                delta = 0                    # process churn/restart between polls
+            cpu_seconds = delta / _CLOCK_TICK
+            cpu_pct = round(min(cpu_seconds / (now - prev_t) * 100.0,
+                                100.0 * (_os.cpu_count() or 1)), 1)
+            _cpu_last.update(ticks=ticks, t=now, value=cpu_pct)
+
+    # --- Memory: sum RSS across all service PIDs -----------------------------
+    mem_bytes = sum(_proc_rss_bytes(p) for p in pids)
+    mem_mb = round(mem_bytes / (1024 * 1024), 1)
+
+    return {
+        "cpuPercent": cpu_pct,
+        "memoryMb":   mem_mb,
+        "procCount":  len(pids),
+    }
+
 # ── API: status ───────────────────────────────────────────────────────────────
 
 def api_status():
     running = sh("systemctl is-active voipd") == "active"
-    uptime_raw = sh(
-        "systemctl show voipd --property=ActiveEnterTimestamp --value")
+    # Uptime of the voipd service. Derived from the main process start time in
+    # /proc (boot-relative starttime vs system uptime) — no external date
+    # parser dependency, works regardless of locale/timezone formatting.
     uptime = ""
-    if uptime_raw and uptime_raw != "n/a":
-        try:
-            import datetime
-            from dateutil import parser as dp
-            t = dp.parse(uptime_raw)
-            delta = (datetime.datetime.now(datetime.timezone.utc)
-                     - t.astimezone(datetime.timezone.utc))
-            h, rem = divmod(int(delta.total_seconds()), 3600)
-            uptime = f"{h}h {rem//60}m" if h else f"{rem//60}m"
-        except Exception:
-            uptime = uptime_raw
+    uptime_seconds = _service_uptime_seconds()
+    if uptime_seconds is not None:
+        d, rem = divmod(int(uptime_seconds), 86400)
+        h, rem = divmod(rem, 3600)
+        m = rem // 60
+        if d:
+            uptime = f"{d}d {h}h {m}m"
+        elif h:
+            uptime = f"{h}h {m}m"
+        else:
+            uptime = f"{m}m"
     conf = read_conf()
     routing_mode = conf.get("ROUTING_MODE", "pbr")
+
+    # Service resource metrics (CPU %, memory MB) — computed from /proc with
+    # no external process spawns. Folded into the status response so the page
+    # gets them on its existing poll with no extra request or timer. Only
+    # sampled when the service is actually running.
+    metrics = api_metrics() if running else {"cpuPercent": 0.0, "memoryMb": 0.0, "procCount": 0}
 
     # In B2BUA mode the SIP endpoint for clients is the gateway itself,
     # not the upstream P-CSCF — the B2BUA terminates SIP locally.
@@ -219,6 +368,9 @@ def api_status():
         "b2buaRegistered": b2bua_registered,
         "b2buaClients":    b2bua_clients,
         "b2buaListenPort": b2bua_listen_port,
+        "cpuPercent":      metrics["cpuPercent"],
+        "memoryMb":        metrics["memoryMb"],
+        "procCount":       metrics["procCount"],
     }
 
 # ── API: logs ─────────────────────────────────────────────────────────────────
@@ -578,7 +730,7 @@ def api_command(body: dict):
         "install-daemon":
             "cd /data/voip && ./voip install",
         "install-all":
-            "cd /data/voip && ./voip install && ./voip install-ui --no-restart",
+            "rm -f /data/voip/ui/.ui-version && cd /data/voip && ./voip install && ./voip install-ui --no-restart",
         "reinstall-daemon":
             "cd /data/voip && ./voip install",
         "uninstall":
@@ -755,11 +907,17 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 result_holder.update(api_command(body))
             t = threading.Thread(target=run, daemon=True)
             t.start()
-            # Long-running commands (update, install) need more time.
+            # Long-running commands need more time than the default. These are
+            # the actual command IDs the UI sends (install-* run ./voip install
+            # which restarts services; uninstall-* tear things down). nginx
+            # proxy_read_timeout is 120s — stay under it with buffer.
             cmd = body.get("command", "")
-            # nginx proxy_read_timeout is 120s — stay under it with buffer
-            wait = 110 if cmd in ("update", "install", "reinstall",
-                                  "uninstall", "uninstall-all") else 10
+            SLOW_COMMANDS = (
+                "update",
+                "install-daemon", "install-ui", "install-all", "reinstall-daemon",
+                "uninstall", "uninstall-ui", "uninstall-all",
+            )
+            wait = 110 if cmd in SLOW_COMMANDS else 10
             t.join(timeout=wait)
             payload = result_holder if result_holder else {
                 "ok": True,

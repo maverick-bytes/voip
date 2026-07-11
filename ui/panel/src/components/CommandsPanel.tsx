@@ -106,14 +106,14 @@ const UninstallDialog = ({ onConfirm, onCancel }: UninstallDialogProps) => (
   </div>
 );
 
-// --- Reinstall scope dialog --------------------------------------------------
+// --- Repair scope dialog -----------------------------------------------------
 
-interface ReinstallDialogProps {
+interface RepairDialogProps {
   onConfirm: (scope: "ui" | "daemon" | "all") => void;
   onCancel: () => void;
 }
 
-const ReinstallDialog = ({ onConfirm, onCancel }: ReinstallDialogProps) => (
+const RepairDialog = ({ onConfirm, onCancel }: RepairDialogProps) => (
   <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-sm">
     <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-md mx-4">
       <div className="flex items-center justify-between px-5 py-4 border-b border-border">
@@ -121,7 +121,7 @@ const ReinstallDialog = ({ onConfirm, onCancel }: ReinstallDialogProps) => (
           <div className="w-8 h-8 rounded-full bg-primary/10 flex items-center justify-center">
             <Download className="w-4 h-4 text-primary" />
           </div>
-          <h2 className="text-sm font-semibold text-card-foreground">Reinstall — Choose Scope</h2>
+          <h2 className="text-sm font-semibold text-card-foreground">Repair — Choose Scope</h2>
         </div>
         <button onClick={onCancel} className="p-1 rounded hover:bg-accent transition-colors text-muted-foreground">
           <X className="w-4 h-4" />
@@ -129,31 +129,32 @@ const ReinstallDialog = ({ onConfirm, onCancel }: ReinstallDialogProps) => (
       </div>
       <div className="p-5 space-y-3">
         <p className="text-xs text-muted-foreground mb-4">
-          Since you can see this UI, nginx is already working. Choose what to reinstall.
+          Re-runs the installer to repair an existing installation in place, overwriting service
+          files and configs with the current versions. Your <span className="font-mono text-card-foreground">voipd.conf</span> is not touched.
         </p>
+        <button onClick={() => onConfirm("daemon")}
+          className="w-full text-left p-4 rounded-lg border border-border hover:border-primary/50 hover:bg-primary/5 transition-colors group">
+          <div className="flex items-center justify-between">
+            <span className="text-sm font-medium text-card-foreground">Daemon</span>
+            <span className="text-xs text-muted-foreground group-hover:text-primary transition-colors font-mono">./voip install</span>
+          </div>
+          <p className="text-xs text-muted-foreground mt-1">Reinstalls the voipd daemon and re-enables its systemd service. Use this if voipd stopped working, e.g. after a UniFi OS firmware update.</p>
+        </button>
         <button onClick={() => onConfirm("ui")}
           className="w-full text-left p-4 rounded-lg border border-border hover:border-primary/50 hover:bg-primary/5 transition-colors group">
           <div className="flex items-center justify-between">
             <span className="text-sm font-medium text-card-foreground">Web UI</span>
             <span className="text-xs text-muted-foreground group-hover:text-primary transition-colors font-mono">./voip install-ui</span>
           </div>
-          <p className="text-xs text-muted-foreground mt-1">Rewrites nginx location config, re-patches site config, regenerates boot hook and restore service.</p>
-        </button>
-        <button onClick={() => onConfirm("daemon")}
-          className="w-full text-left p-4 rounded-lg border border-border hover:border-primary/50 hover:bg-primary/5 transition-colors group">
-          <div className="flex items-center justify-between">
-            <span className="text-sm font-medium text-card-foreground">Daemon only</span>
-            <span className="text-xs text-muted-foreground group-hover:text-primary transition-colors font-mono">./voip install</span>
-          </div>
-          <p className="text-xs text-muted-foreground mt-1">Reinstalls voipd and re-enables its systemd service. Use if voipd stopped working after a firmware upgrade.</p>
+          <p className="text-xs text-muted-foreground mt-1">Refreshes the web UI: rewrites the nginx location config, re-patches the site config, and regenerates the boot hook and restore service. The UI restarts itself after the result is shown.</p>
         </button>
         <button onClick={() => onConfirm("all")}
-          className="w-full text-left p-4 rounded-lg border border-blue-500/30 hover:border-blue-500 hover:bg-blue-500/5 transition-colors group">
+          className="w-full text-left p-4 rounded-lg border border-primary/30 hover:border-primary hover:bg-primary/5 transition-colors group">
           <div className="flex items-center justify-between">
-            <span className="text-sm font-semibold text-blue-400">Everything</span>
-            <span className="text-xs text-muted-foreground group-hover:text-blue-400 transition-colors font-mono">install + install-ui</span>
+            <span className="text-sm font-semibold text-primary">Everything</span>
+            <span className="text-xs text-muted-foreground group-hover:text-primary transition-colors font-mono">install + install-ui</span>
           </div>
-          <p className="text-xs text-muted-foreground mt-1">Reinstalls both voipd and the web UI in one go.</p>
+          <p className="text-xs text-muted-foreground mt-1">Repairs both the daemon and the web UI in one pass.</p>
         </button>
       </div>
       <div className="px-5 pb-4 flex justify-end">
@@ -168,13 +169,13 @@ const ReinstallDialog = ({ onConfirm, onCancel }: ReinstallDialogProps) => (
 
 const commands = [
   {
-    id: "reinstall",
-    label: "Reinstall",
-    description: "Reinstall the web UI, voipd daemon, or both. Choose scope in the next step.",
-    command: "./voip install-ui / install / both",
+    id: "repair",
+    label: "Repair Installation",
+    description: "Re-run the installer to repair the daemon, web UI, or both in place. Choose scope in the next step.",
+    command: "./voip install / install-ui / both",
     icon: Download,
     variant: "install" as const,
-    hasReinstallDialog: true,
+    hasRepairDialog: true,
   },
   {
     id: "update",
@@ -216,7 +217,7 @@ const variantStyles = {
 const CommandsPanel = () => {
   const [running, setRunning] = useState<string | null>(null);
   const [showUninstallDialog, setShowUninstallDialog] = useState(false);
-  const [showReinstallDialog, setShowReinstallDialog] = useState(false);
+  const [showRepairDialog, setShowRepairDialog] = useState(false);
   const [result, setResult] = useState<{ label: string; ok: boolean; output: string } | null>(null);
 
   const runCommand = async (cmdId: string, label: string) => {
@@ -238,9 +239,9 @@ const CommandsPanel = () => {
     runCommand(map[scope][0], map[scope][1]);
   };
 
-  const handleReinstallConfirm = (scope: "ui" | "daemon" | "all") => {
-    setShowReinstallDialog(false);
-    const map = { ui: ["install-ui", "Reinstall Web UI"], daemon: ["install-daemon", "Reinstall Daemon"], all: ["install-all", "Reinstall Everything"] } as const;
+  const handleRepairConfirm = (scope: "ui" | "daemon" | "all") => {
+    setShowRepairDialog(false);
+    const map = { ui: ["install-ui", "Repair Web UI"], daemon: ["install-daemon", "Repair Daemon"], all: ["install-all", "Repair Everything"] } as const;
     runCommand(map[scope][0], map[scope][1]);
   };
 
@@ -249,8 +250,8 @@ const CommandsPanel = () => {
       {showUninstallDialog && (
         <UninstallDialog onConfirm={handleUninstallConfirm} onCancel={() => setShowUninstallDialog(false)} />
       )}
-      {showReinstallDialog && (
-        <ReinstallDialog onConfirm={handleReinstallConfirm} onCancel={() => setShowReinstallDialog(false)} />
+      {showRepairDialog && (
+        <RepairDialog onConfirm={handleRepairConfirm} onCancel={() => setShowRepairDialog(false)} />
       )}
       {result && (
         <ResultDialog ok={result.ok} output={result.output} title={result.label} onClose={() => setResult(null)} />
@@ -260,7 +261,7 @@ const CommandsPanel = () => {
         {commands.map(cmd => {
           const Icon = cmd.icon;
           const isRunning = running === cmd.id
-            || (cmd.id === "reinstall" && ["install-ui", "install-daemon", "install-all"].includes(running ?? ""))
+            || (cmd.id === "repair" && ["install-ui", "install-daemon", "install-all"].includes(running ?? ""))
             || (cmd.id === "uninstall" && ["uninstall", "uninstall-ui", "uninstall-all"].includes(running ?? ""));
           return (
             <div key={cmd.id} className="unifi-card">
@@ -278,7 +279,7 @@ const CommandsPanel = () => {
                   </div>
                 </div>
                 <button
-                  onClick={() => cmd.hasDialog ? setShowUninstallDialog(true) : cmd.hasReinstallDialog ? setShowReinstallDialog(true) : runCommand(cmd.id, cmd.label)}
+                  onClick={() => cmd.hasDialog ? setShowUninstallDialog(true) : cmd.hasRepairDialog ? setShowRepairDialog(true) : runCommand(cmd.id, cmd.label)}
                   disabled={!!running}
                   className={`shrink-0 flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium transition-colors disabled:opacity-50 ${variantStyles[cmd.variant]}`}
                 >

@@ -17,13 +17,10 @@ const AppSidebar = ({ activeTab, onTabChange }: AppSidebarProps) => {
   return (
     <aside className="w-56 bg-sidebar border-r border-sidebar-border flex flex-col min-h-screen">
       <div className="px-4 py-5 border-b border-sidebar-border flex items-center gap-2.5">
-        <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
+        <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center flex-none">
           <Phone className="w-4 h-4 text-primary-foreground" />
         </div>
-        <div>
-          <h1 className="text-sm font-semibold text-sidebar-accent-foreground">VoIP</h1>
-          <p className="text-[10px] text-sidebar-foreground">UniFi OS</p>
-        </div>
+        <h1 className="text-base font-semibold leading-tight tracking-[0.01em] text-sidebar-accent-foreground">VoIP</h1>
       </div>
 
       <nav className="flex-1 py-3 px-2 space-y-0.5">
@@ -52,12 +49,12 @@ const AppSidebar = ({ activeTab, onTabChange }: AppSidebarProps) => {
           href="https://ko-fi.com/H2H31UPAFR"
           target="_blank"
           rel="noopener noreferrer"
-          className="w-full flex items-center gap-2 px-3 py-2 rounded-md text-sm font-medium bg-[hsl(340,80%,55%)] text-white hover:bg-[hsl(340,80%,48%)] transition-colors"
+          className="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-md text-sm font-medium bg-[hsl(340,80%,55%)] text-white hover:bg-[hsl(340,80%,48%)] transition-colors"
         >
-          <Heart className="w-4 h-4" />
+          <Heart className="w-[15px] h-[15px]" fill="currentColor" strokeWidth={0} />
           Donate
         </a>
-        <p className="text-[10px] text-sidebar-foreground">v1.4.1 • GPL-2.0</p>
+        <p className="text-[10px] text-sidebar-foreground">v1.4.2 • GPL-2.0</p>
       </div>
     </aside>
   );
